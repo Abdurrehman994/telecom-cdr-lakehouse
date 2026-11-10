@@ -1,5 +1,10 @@
 # Telecom Fraud Detection & Prevention System - Setup Guide
 
+> This repository continues a University of Oulu group project
+> ([original repo](https://github.com/FastByte17/DS_Project_2026)) built by
+> Nabeel Hussain, Muhammad Abdur Rehman, Christoph Gasche, Marko Tiitto and Talha Pasha.
+> Work from November 2026 onward is by Muhammad Abdur Rehman.
+
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Initial Setup](#initial-setup)
