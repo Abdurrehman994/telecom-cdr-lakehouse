@@ -1,6 +1,5 @@
 import requests
 import json
-import pika
 import threading
 import time
 import numpy as np
@@ -11,6 +10,7 @@ from prometheus_client import Counter, Histogram, generate_latest, REGISTRY
 from fastapi.responses import Response
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
+from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
 import os
 
 # prometheus metrics
@@ -292,56 +292,75 @@ Analysis:"""
 # initialize detector
 detector = FraudDetectionEngine()
 
-# rabbitMQ Consumer
-class RabbitMQConsumer:
+# kafka Consumer
+class CDRConsumer:
+    """reads CDRs from a kafka topic as part of a consumer group.
+
+    every ml-service replica uses the same group.id, so kafka splits the
+    topic's partitions between them. offsets are stored only after a CDR is
+    fully processed, which gives at-least-once delivery: a crash mid-message
+    means that message is read again, never skipped.
+    """
     def __init__(
-            self, 
-            host='rabbitmq', 
-            queue='CDR', 
-            username=os.getenv("RABBITMQ_DEFAULT_USER", "NOT_SET"),
-            password=os.getenv("RABBITMQ_DEFAULT_PASS", "NOT_SET")
+            self,
+            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
+            topic=os.getenv("KAFKA_TOPIC", "cdr-events"),
+            group_id=os.getenv("KAFKA_GROUP_ID", "fraud-detection"),
+            dlq_topic=os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq")
             ):
-        self.host = host
-        self.queue = queue
-        self.connection = None
-        self.channel = None
-        self.username=username
-        self.password=password
-        
+        self.bootstrap_servers = bootstrap_servers
+        self.topic = topic
+        self.group_id = group_id
+        self.dlq_topic = dlq_topic
+        self.consumer = None
+        self.dlq_producer = None
+        self.running = False
+
     def connect(self):
-        """connect to rabbitMQ with retry logic"""
-        max_retries = 10
-        retry_delay = 5
-        for attempt in range(max_retries):
-            try:
-                _credentials = pika.PlainCredentials(self.username, self.password)
-                print(f"Connecting to rabbitMQ at {self.host}... (attempt {attempt + 1}/{max_retries})")
-                self.connection = pika.BlockingConnection(
-                    pika.ConnectionParameters(
-                        host=self.host,
-                        heartbeat=600,
-                        blocked_connection_timeout=300,
-                        credentials=_credentials
-                    )
-                )
-                self.channel = self.connection.channel()
-                self.channel.queue_declare(queue=self.queue, durable=True)
-                print(f"connected to rabbitMQ queue: {self.queue}")
-                return True
-            except Exception as e:
-                print(f"rabbitMQ connection failed: {e}")
-                if attempt < max_retries - 1:
-                    print(f"retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
-                    print("failed to connect to rabbitMQ after all retries")
-                    return False
-    
-    def callback(self, ch, method, properties, body):
-        """process incoming CDR from rabbitMQ"""
+        """create the consumer and subscribe to the topic"""
+        self.consumer = Consumer({
+            "bootstrap.servers": self.bootstrap_servers,
+            "group.id": self.group_id,
+            "client.id": os.getenv("HOSTNAME", "ml-service"),
+            # a brand new group starts from the oldest message, not just new ones
+            "auto.offset.reset": "earliest",
+            # commit in the background, but only offsets we stored ourselves
+            # after processing (see process_message)
+            "enable.auto.commit": True,
+            "enable.auto.offset.store": False,
+        })
+        self.dlq_producer = Producer({
+            "bootstrap.servers": self.bootstrap_servers,
+            "acks": "all",
+        })
+        self.consumer.subscribe(
+            [self.topic],
+            on_assign=lambda c, parts: print(f"assigned partitions: {[p.partition for p in parts]}"),
+            on_revoke=lambda c, parts: print(f"revoked partitions: {[p.partition for p in parts]}"),
+        )
+        print(f"subscribed to kafka topic: {self.topic} (group: {self.group_id})")
+        return True
+
+    def send_to_dlq(self, msg, error: Exception):
+        """park a message that could not be processed, so it is not lost"""
+        self.dlq_producer.produce(
+            self.dlq_topic,
+            key=msg.key(),
+            value=msg.value(),
+            headers={
+                "error": str(error),
+                "source_partition": str(msg.partition()),
+                "source_offset": str(msg.offset()),
+            },
+        )
+        self.dlq_producer.flush(10)
+        print(f"sent message from partition {msg.partition()} offset {msg.offset()} to {self.dlq_topic}")
+
+    def process_message(self, msg):
+        """process one CDR from kafka"""
         try:
             # parse CDR
-            cdr = json.loads(body)
+            cdr = json.loads(msg.value())
             print(f"\nreceived CDR: {cdr.get('transaction_id', 'Unknown')}")
             
             # detect fraud
@@ -361,43 +380,41 @@ class RabbitMQConsumer:
             else:
                 print(f"clean transaction")
                 cdr_processed.labels(status='clean').inc()
-            
-            # acknowledge message
-            ch.basic_ack(delivery_tag=method.delivery_tag)
-            
+
         except Exception as e:
             print(f"error processing CDR: {e}")
             cdr_processed.labels(status='error').inc()
-            # reject and don't requeue if processing fails
-            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
-    
+            # don't block the partition on a bad message, park it in the DLQ
+            self.send_to_dlq(msg, e)
+
+        # mark as done; the next auto-commit saves this position
+        self.consumer.store_offsets(message=msg)
+
     def start_consuming(self):
-        """start consuming messages from rabbitMQ"""
+        """poll kafka until stop() is called"""
+        self.running = True
+        print(f"\nlistening for CDRs on topic: {self.topic}\n")
         try:
-            self.channel.basic_qos(prefetch_count=1)
-            self.channel.basic_consume(
-                queue=self.queue,
-                on_message_callback=self.callback
-            )
-            
-            print(f"\nlistening for CDRs on queue: {self.queue}")
-            print("press CTRL+C to stop\n")
-            self.channel.start_consuming()
-            
-        except KeyboardInterrupt:
-            print("\nstopping consumer...")
-            self.stop()
-        except Exception as e:
+            while self.running:
+                msg = self.consumer.poll(1.0)
+                if msg is None:
+                    continue
+                if msg.error():
+                    if msg.error().code() != KafkaError._PARTITION_EOF:
+                        print(f"consumer error: {msg.error()}")
+                    continue
+                self.process_message(msg)
+        except KafkaException as e:
             print(f"consumer error: {e}")
-            self.stop()
-    
+        finally:
+            # commits stored offsets and leaves the group, so the other
+            # replicas take over this replica's partitions right away
+            self.consumer.close()
+            print("disconnected from kafka")
+
     def stop(self):
-        """stop consuming and close connection"""
-        if self.channel:
-            self.channel.stop_consuming()
-        if self.connection:
-            self.connection.close()
-        print("disconnected from rabbitMQ")
+        """ask the poll loop to finish"""
+        self.running = False
 
 # global consumer instance
 consumer = None
@@ -443,18 +460,26 @@ def send_alert_to_prometheus(cdr: Dict, detection_result: Dict):
 # FastAPI Endpoints
 @app.on_event("startup")
 async def startup_event():
-    """start rabbitMQ consumer on startup"""
+    """start kafka consumer on startup"""
     global consumer
-    
+
+    consumer = CDRConsumer()
+
     def start_consumer():
-        consumer = RabbitMQConsumer(host='rabbitmq', queue='CDR')
         if consumer.connect():
             consumer.start_consuming()
-    
+
     # start consumer in background thread
     consumer_thread = threading.Thread(target=start_consumer, daemon=True)
     consumer_thread.start()
-    print("ml service started, rabbitMQ consumer running in background")
+    print("ml service started, kafka consumer running in background")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """stop the kafka consumer cleanly"""
+    if consumer:
+        consumer.stop()
+        time.sleep(2)
 
 @app.post("/detect")
 async def detect_fraud_endpoint(cdr: Dict):
@@ -500,7 +525,7 @@ async def root():
         "service": "ML Fraud Detection Service",
         "version": "2.0.0",
         "status": "running",
-        "rabbitmq": "consuming from cdr_queue",
+        "kafka": f"consuming from {consumer.topic if consumer else 'cdr-events'}",
         "endpoints": {
             "detect": "POST /detect (manual testing)",
             "health": "GET /health",

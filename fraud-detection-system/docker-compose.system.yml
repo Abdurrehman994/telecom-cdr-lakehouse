@@ -123,12 +123,13 @@ services:
       - "8001:8001"
     environment:
       OLLAMA_HOST: http://ollama:11434
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_DEFAULT_USER: myuser
-      RABBITMQ_DEFAULT_PASS: mypassword
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: cdr-events
+      KAFKA_GROUP_ID: fraud-detection
+      KAFKA_DLQ_TOPIC: cdr-events-dlq
     depends_on:
-      rabbitmq:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       ollama:
         condition: service_started
       prometheus:
@@ -144,12 +145,13 @@ services:
       - "8002:8001"
     environment:
       OLLAMA_HOST: http://ollama:11434
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_DEFAULT_USER: myuser
-      RABBITMQ_DEFAULT_PASS: mypassword
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: cdr-events
+      KAFKA_GROUP_ID: fraud-detection
+      KAFKA_DLQ_TOPIC: cdr-events-dlq
     depends_on:
-      rabbitmq:
-        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       ollama:
         condition: service_started
       prometheus:
@@ -240,9 +242,12 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
-    command: >
-      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
-      --create --if-not-exists --topic cdr-events --partitions 3 --replication-factor 1
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic cdr-events --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic cdr-events-dlq --partitions 1 --replication-factor 1
     networks:
       - fraud-detection-network
     restart: "no"
