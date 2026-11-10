@@ -21,7 +21,7 @@ from typing import Dict, List, Optional
 
 import pyarrow as pa
 from pyarrow import fs
-from confluent_kafka import Consumer, KafkaError, Producer, TopicPartition
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
 from pyiceberg.catalog import load_catalog
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
@@ -213,7 +213,10 @@ class LakehouseWriter:
         # is correct even for partitions that get no new messages
         resumed = [TopicPartition(KAFKA_TOPIC, p.partition, p.offset) for p in partitions if p.offset >= 0]
         if resumed:
-            consumer.commit(offsets=resumed, asynchronous=False)
+            try:
+                consumer.commit(offsets=resumed, asynchronous=False)
+            except KafkaException as e:
+                logger.warning(f"Kafka offset commit failed, consumer lag may be stale: {e}")
 
     def on_revoke(self, consumer, partitions):
         """write out what we have before another consumer takes over"""
@@ -241,25 +244,46 @@ class LakehouseWriter:
             return
 
         # merge with the stored offsets so partitions without new rows keep theirs
-        offsets = self.stored_offsets()
-        offsets.update({str(p): o for p, o in self.pending_offsets.items()})
+        stored = self.stored_offsets()
+        offsets = dict(stored)
+        for p, o in self.pending_offsets.items():
+            offsets[str(p)] = max(o, stored.get(str(p), 0))
 
-        if self.buffer:
-            batch = pa.Table.from_pylist(self.buffer, schema=self.arrow_schema)
+        # Append only rows Iceberg does not have yet, each once. Normally that is the whole
+        # buffer; this guards against writing a batch twice after a failure or a rebalance.
+        rows, seen = [], set()
+        for row in self.buffer:
+            position = (row["kafka_partition"], row["kafka_offset"])
+            if row["kafka_offset"] >= stored.get(str(row["kafka_partition"]), 0) and position not in seen:
+                seen.add(position)
+                rows.append(row)
+        if len(rows) < len(self.buffer):
+            logger.warning(f"Skipped {len(self.buffer) - len(rows)} rows already in {ICEBERG_TABLE}")
+
+        if rows:
+            batch = pa.Table.from_pylist(rows, schema=self.arrow_schema)
             self.table.append(batch, snapshot_properties={OFFSETS_PROPERTY: json.dumps(offsets)})
             logger.info(
-                f"Appended {len(self.buffer)} rows to {ICEBERG_TABLE} "
+                f"Appended {len(rows)} rows to {ICEBERG_TABLE} "
                 f"(snapshot {self.table.current_snapshot().snapshot_id}, offsets {offsets})"
             )
 
-        # Iceberg is the source of truth; this commit just keeps consumer lag accurate
-        self.consumer.commit(
-            offsets=[TopicPartition(KAFKA_TOPIC, p, o) for p, o in self.pending_offsets.items()],
-            asynchronous=False,
-        )
+        # The rows are durable now, so clear the buffer before anything else can fail or
+        # call back into flush(): a blocking Kafka commit can trigger on_revoke -> flush()
+        committed = self.pending_offsets
         self.buffer = []
         self.pending_offsets = {}
         self.last_flush = time.monotonic()
+
+        # Iceberg is the source of truth; this commit only keeps consumer lag accurate,
+        # so a failure (e.g. the broker restarting) is logged, not fatal
+        try:
+            self.consumer.commit(
+                offsets=[TopicPartition(KAFKA_TOPIC, p, o) for p, o in committed.items()],
+                asynchronous=False,
+            )
+        except KafkaException as e:
+            logger.warning(f"Kafka offset commit failed, consumer lag may be stale: {e}")
 
     def run(self):
         self.consumer.subscribe([KAFKA_TOPIC], on_assign=self.on_assign, on_revoke=self.on_revoke)
