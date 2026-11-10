@@ -1,13 +1,18 @@
 """Kafka Publisher Service for CDR ingestion"""
 import json
 import logging
-from typing import Dict, Any, Optional
+import threading
+import time
+from typing import Dict, Any, List, Optional
 from datetime import datetime
 from confluent_kafka import Producer, KafkaException
 from app.config import settings
 
 
 logger = logging.getLogger(__name__)
+
+# How long the producer keeps retrying a message before reporting it as failed
+DELIVERY_TIMEOUT_MS = 10000
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -41,6 +46,8 @@ class KafkaPublisher:
                 "enable.idempotence": True,
                 # Wait up to 10 ms to batch messages together
                 "linger.ms": 10,
+                # Fail fast so the API can answer 503 instead of hanging for the 5 minute default
+                "delivery.timeout.ms": DELIVERY_TIMEOUT_MS,
             })
             metadata = self.producer.list_topics(topic=self.topic, timeout=5)
             if metadata.topics[self.topic].error is not None:
@@ -54,36 +61,58 @@ class KafkaPublisher:
             logger.error(f"Failed to connect to Kafka: {str(e)}")
             return False
 
-    def _on_delivery(self, err, msg) -> None:
-        """Called by the producer once the broker confirms or rejects a message"""
-        if err is not None:
-            logger.error(f"Kafka delivery failed for key {msg.key()}: {err}")
-        else:
-            logger.debug(f"Delivered to {msg.topic()} partition {msg.partition()} offset {msg.offset()}")
+    def _produce(self, message: Dict[str, Any], outcome: Dict[str, Optional[str]]) -> threading.Event:
+        """Queue a CDR for sending; the returned event is set once the broker confirms or rejects it"""
+        done = threading.Event()
 
-    def publish(self, message: Dict[str, Any]) -> bool:
-        """Publish a CDR record to Kafka, keyed by customer_id"""
+        def on_delivery(err, msg):
+            outcome["error"] = str(err) if err is not None else None
+            done.set()
+
+        # Same key -> same partition, so each customer's CDRs stay in order
+        key = str(message.get("customer_id", ""))
+        self.producer.produce(
+            self.topic,
+            key=key.encode("utf-8"),
+            value=json.dumps(message, cls=DateTimeEncoder).encode("utf-8"),
+            on_delivery=on_delivery,
+        )
+        return done
+
+    def publish_batch(self, messages: List[Dict[str, Any]]) -> List[Optional[str]]:
+        """Publish CDRs and wait until the broker has stored each one.
+
+        Returns one entry per message: None if it was delivered, otherwise the error.
+        Blocks for up to the delivery timeout, so call it from a worker thread.
+        """
         if self.producer is None and not self.init_connection():
-            return False
+            return ["Kafka is unavailable"] * len(messages)
 
-        try:
-            # Same key -> same partition, so each customer's CDRs stay in order
-            key = str(message.get("customer_id", ""))
-            self.producer.produce(
-                self.topic,
-                key=key.encode("utf-8"),
-                value=json.dumps(message, cls=DateTimeEncoder).encode("utf-8"),
-                on_delivery=self._on_delivery,
-            )
-            # Serve delivery callbacks for earlier messages without blocking
-            self.producer.poll(0)
+        outcomes = [{"error": "Kafka did not confirm delivery in time"} for _ in messages]
+        pending = []
+        for message, outcome in zip(messages, outcomes):
+            try:
+                pending.append(self._produce(message, outcome))
+            except (KafkaException, BufferError) as e:
+                outcome["error"] = str(e)
 
-            logger.info(f"Published CDR {message.get('transaction_id')} to {self.topic}")
-            return True
+        # The producer gives up after delivery.timeout.ms; the extra seconds cover callback scheduling
+        deadline = time.monotonic() + DELIVERY_TIMEOUT_MS / 1000 + 5
+        for done in pending:
+            while not done.is_set() and time.monotonic() < deadline:
+                self.producer.poll(0.1)
 
-        except (KafkaException, BufferError) as e:
-            logger.error(f"Failed to publish message to Kafka: {str(e)}")
-            return False
+        errors = [outcome["error"] for outcome in outcomes]
+        for message, error in zip(messages, errors):
+            if error is None:
+                logger.info(f"Published CDR {message.get('transaction_id')} to {self.topic}")
+            else:
+                logger.error(f"Failed to publish CDR {message.get('transaction_id')} to Kafka: {error}")
+        return errors
+
+    def publish(self, message: Dict[str, Any]) -> Optional[str]:
+        """Publish one CDR and wait for the broker; returns None on success, otherwise the error"""
+        return self.publish_batch([message])[0]
 
     def close_connection(self) -> None:
         """Send any buffered messages before shutting down"""

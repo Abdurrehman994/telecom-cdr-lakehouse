@@ -4,6 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, status
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse
 
 from app.config import settings
@@ -152,25 +153,22 @@ async def ingest_cdr(record: CDRRecord):
         #         detail=f"Database error: {str(e)}"
         #     )
         
-        # Publish to Kafka
-        try:
-            publisher_instance = get_publisher()
-            if publisher_instance:
-                publisher_result = publisher_instance.publish(enriched_cdr)
-                if publisher_result:
-                    logger.info(f"CDR {record.transaction_id} published to Kafka")
-                else:
-                    logger.warning(f"Failed to publish CDR {record.transaction_id} to Kafka")
-        except Exception as e:
-            logger.error(f"Kafka error publishing CDR {record.transaction_id}: {str(e)}")
-            # Don't fail the whole request if Kafka fails, just log it
+        # Publish to Kafka and only answer once the broker has stored the CDR,
+        # so a 202 never hides a lost record. The wait blocks, so it runs off the event loop.
+        publisher_instance = get_publisher()
+        error = await run_in_threadpool(publisher_instance.publish, enriched_cdr)
+        if error is not None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Could not publish CDR to Kafka, retry later: {error}"
+            )
 
         logger.info(f"Successfully ingested CDR {record.transaction_id}")
-        
+
         return CDRIngestionResponse(
             status="accepted",
             transaction_id=record.transaction_id,
-            message=f"CDR record {record.transaction_id} accepted and saved to database"
+            message=f"CDR record {record.transaction_id} accepted and stored in Kafka"
         )
         
     except HTTPException:
@@ -197,6 +195,7 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
     
     # db_instance = get_db_service()
     publisher_instance = get_publisher()
+    to_publish = []
 
     for idx, record in enumerate(records):
         try:
@@ -218,21 +217,9 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
             # db_saved = False
             # if db_instance:
             #     db_saved = db_instance.save_cdr(enriched_cdr)
-            
-            mq_published = False
-            if publisher_instance:
-                mq_published = publisher_instance.publish(enriched_cdr)
 
-            if mq_published:
-                results["accepted"] += 1
-            else:
-                results["rejected"] += 1
-                results["errors"].append({
-                    "index": idx,
-                    "transaction_id": record.transaction_id,
-                    "error": "Failed to save/publish CDR"
-                })
-                
+            to_publish.append((idx, record.transaction_id, enriched_cdr))
+
         except Exception as e:
             results["rejected"] += 1
             results["errors"].append({
@@ -240,7 +227,22 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
                 "transaction_id": record.transaction_id if hasattr(record, 'transaction_id') else "unknown",
                 "error": str(e)
             })
-    
+
+    # Send the whole batch, then wait once for all broker confirmations
+    errors = await run_in_threadpool(
+        publisher_instance.publish_batch, [cdr for _, _, cdr in to_publish]
+    )
+    for (idx, transaction_id, _), error in zip(to_publish, errors):
+        if error is None:
+            results["accepted"] += 1
+        else:
+            results["rejected"] += 1
+            results["errors"].append({
+                "index": idx,
+                "transaction_id": transaction_id,
+                "error": f"Could not publish CDR to Kafka: {error}"
+            })
+
     logger.info(f"Batch processing complete: {results['accepted']} accepted, {results['rejected']} rejected")
     
     return results
