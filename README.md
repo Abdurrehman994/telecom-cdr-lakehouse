@@ -48,27 +48,16 @@ cd fraud-detection-system
 
 ---
 
-### 2. Set Up Environment Variables
+### 2. Environment Variables (optional)
 
-Create .env file in ´/fraud-detection-system/´ with the example content. 
+No `.env` file is needed to run the stack locally. `docker-compose.system.yml` has development defaults for every setting:
 
-Feel free to change the credentials.
+| Setting | Default |
+|---|---|
+| Grafana login | `admin` / `admin` |
+| Lakehouse S3 credentials | `lakehouse` / `lakehouse-secret` |
 
-Example content:
-
-```
-# Grafana Credentials
-GRAFANA_ADMIN_USER=FOOBAR
-GRAFANA_ADMIN_PASSWORD=FOOBAR123
-
-# Alertmanager Email Configuration
-ALERTMANAGER_EMAIL=your-email@example.com
-ALERTMANAGER_EMAIL_PASSWORD=your-app-password
-
-```
-
-
-The CDR ingestion and ML services need no `.env` file: their Kafka, service and database settings are set in `docker-compose.system.yml`.
+To override them, copy `fraud-detection-system/.env.example` to `fraud-detection-system/.env` and change the values. Always override the defaults on any machine other than your own.
 
 ---
 
