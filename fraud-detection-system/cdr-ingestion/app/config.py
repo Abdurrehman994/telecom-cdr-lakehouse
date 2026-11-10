@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     rabbitmq_password: str = Field(..., description="RabbitMQ password from RABBITMQ_PASSWORD env var")
     rabbitmq_queue: str = Field(..., description="RabbitMQ queue from RABBITMQ_QUEUE env var")
     
+    # Kafka Configuration
+    kafka_bootstrap_servers: str = Field("kafka:9092", description="Kafka brokers from KAFKA_BOOTSTRAP_SERVERS env var")
+    kafka_topic: str = Field("cdr-events", description="Kafka topic from KAFKA_TOPIC env var")
+
     # PostgreSQL Configuration
     postgres_host: str = Field(..., description="PostgreSQL host from POSTGRES_HOST env var")
     postgres_port: int = Field(..., description="PostgreSQL port from POSTGRES_PORT env var")

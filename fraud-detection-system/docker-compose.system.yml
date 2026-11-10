@@ -171,7 +171,14 @@ services:
       RABBITMQ_PORT: 5672
       RABBITMQ_DEFAULT_USER: myuser
       RABBITMQ_DEFAULT_PASS: mypassword
+      RABBITMQ_USER: myuser
+      RABBITMQ_PASSWORD: mypassword
+      RABBITMQ_QUEUE: CDR
+      SERVICE_NAME: cdr-ingestion
+      SERVICE_VERSION: 2.0.0
       CDR_QUEUE_NAME: CDR
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: cdr-events
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: fraud_user
@@ -181,13 +188,15 @@ services:
     depends_on:
       rabbitmq:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       # postgres:
       #   condition: service_healthy
     networks:
       - fraud-detection-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -223,6 +232,20 @@ services:
     networks:
       - fraud-detection-network
     restart: unless-stopped
+
+  # One-shot job: creates topics, then exits (auto topic creation is disabled)
+  kafka-init:
+    image: apache/kafka:3.9.1
+    container_name: kafka_init_1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command: >
+      /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092
+      --create --if-not-exists --topic cdr-events --partitions 3 --replication-factor 1
+    networks:
+      - fraud-detection-network
+    restart: "no"
 
   rabbitmq:
     image: rabbitmq:3-management
