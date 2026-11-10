@@ -8,7 +8,6 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.schemas import CDRRecord, CDRIngestionResponse, HealthResponse
-from app.services.rabbitmq_publisher import RabbitMQPublisher
 from app.services.kafka_publisher import KafkaPublisher
 from app.services.database import DatabaseService
 from app.processors.cdr_validator import validate_cdr
@@ -24,8 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 # Global instances
-publisher: RabbitMQPublisher = None
-kafka_publisher: KafkaPublisher = None
+publisher: KafkaPublisher = None
 db_service: DatabaseService = None
 
 
@@ -33,7 +31,7 @@ db_service: DatabaseService = None
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown"""
     # Startup
-    global publisher, kafka_publisher, db_service
+    global publisher, db_service
     logger.info(f"Starting {settings.service_name} v{settings.service_version}")
     
     # Initialize database
@@ -43,18 +41,12 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Database initialized successfully")
     
-    # Initialize RabbitMQ publisher
-    publisher = RabbitMQPublisher(queue_name=settings.rabbitmq_queue)
+    # Initialize Kafka publisher
+    publisher = KafkaPublisher(topic=settings.kafka_topic)
     if not publisher.init_connection():
-        logger.warning("Failed to connect to RabbitMQ on startup")
-
-    # Initialize Kafka publisher (runs alongside RabbitMQ during the migration)
-    kafka_publisher = KafkaPublisher(topic=settings.kafka_topic)
-    if not kafka_publisher.init_connection():
         logger.warning("Failed to connect to Kafka on startup")
 
     app.state.publisher = publisher
-    app.state.kafka_publisher = kafka_publisher
     app.state.db_service = db_service
     
     logger.info(f"{settings.service_name} started successfully")
@@ -65,8 +57,6 @@ async def lifespan(app: FastAPI):
     logger.info(f"Shutting down {settings.service_name}")
     if publisher:
         publisher.close_connection()
-    if kafka_publisher:
-        kafka_publisher.close_connection()
     if db_service:
         db_service.close()
     logger.info(f"{settings.service_name} shut down complete")
@@ -81,14 +71,9 @@ app = FastAPI(
 )
 
 
-def get_publisher() -> RabbitMQPublisher:
-    """Get the RabbitMQ publisher instance"""
-    return app.state.publisher
-
-
-def get_kafka_publisher() -> KafkaPublisher:
+def get_publisher() -> KafkaPublisher:
     """Get the Kafka publisher instance"""
-    return app.state.kafka_publisher
+    return app.state.publisher
 
 
 def get_db_service() -> DatabaseService:
@@ -110,13 +95,11 @@ async def root():
 async def health_check():
     """Health check endpoint"""
     publisher_instance = get_publisher()
-    rabbitmq_healthy = publisher_instance.health_check() if publisher_instance else False
-    kafka_instance = get_kafka_publisher()
-    kafka_healthy = kafka_instance.health_check() if kafka_instance else False
+    kafka_healthy = publisher_instance.health_check() if publisher_instance else False
 
     return HealthResponse(
         service=settings.service_name,
-        status="healthy" if rabbitmq_healthy and kafka_healthy else "degraded",
+        status="healthy" if kafka_healthy else "degraded",
         version=settings.service_version
     )
 
@@ -128,7 +111,7 @@ async def health_check():
     tags=["CDR Ingestion"]
 )
 async def ingest_cdr(record: CDRRecord):
-    """Ingest a CDR record - saves to database and publishes to RabbitMQ"""
+    """Ingest a CDR record - validates, enriches and publishes to Kafka"""
     try:
         # Validate CDR record
         cdr_dict = record.model_dump(exclude_none=True)
@@ -169,29 +152,18 @@ async def ingest_cdr(record: CDRRecord):
         #         detail=f"Database error: {str(e)}"
         #     )
         
-        # Publish to RabbitMQ
+        # Publish to Kafka
         try:
             publisher_instance = get_publisher()
             if publisher_instance:
                 publisher_result = publisher_instance.publish(enriched_cdr)
                 if publisher_result:
-                    logger.info(f"CDR {record.transaction_id} published to RabbitMQ")
-                else:
-                    logger.warning(f"Failed to publish CDR {record.transaction_id} to RabbitMQ")
-        except Exception as e:
-            logger.error(f"RabbitMQ error publishing CDR {record.transaction_id}: {str(e)}")
-            # Don't fail the whole request if RabbitMQ fails, just log it
-
-        # Publish to Kafka
-        try:
-            kafka_instance = get_kafka_publisher()
-            if kafka_instance:
-                if kafka_instance.publish(enriched_cdr):
                     logger.info(f"CDR {record.transaction_id} published to Kafka")
                 else:
                     logger.warning(f"Failed to publish CDR {record.transaction_id} to Kafka")
         except Exception as e:
             logger.error(f"Kafka error publishing CDR {record.transaction_id}: {str(e)}")
+            # Don't fail the whole request if Kafka fails, just log it
 
         logger.info(f"Successfully ingested CDR {record.transaction_id}")
         
@@ -225,7 +197,6 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
     
     # db_instance = get_db_service()
     publisher_instance = get_publisher()
-    kafka_instance = get_kafka_publisher()
 
     for idx, record in enumerate(records):
         try:
@@ -252,11 +223,7 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
             if publisher_instance:
                 mq_published = publisher_instance.publish(enriched_cdr)
 
-            kafka_published = False
-            if kafka_instance:
-                kafka_published = kafka_instance.publish(enriched_cdr)
-
-            if mq_published and kafka_published:
+            if mq_published:
                 results["accepted"] += 1
             else:
                 results["rejected"] += 1
@@ -288,8 +255,8 @@ async def get_stats():
     return {
         "service": settings.service_name,
         "version": settings.service_version,
-        "rabbitmq_queue": settings.rabbitmq_queue,
-        "rabbitmq_host": settings.rabbitmq_host,
+        "kafka_topic": settings.kafka_topic,
+        "kafka_bootstrap_servers": settings.kafka_bootstrap_servers,
         "database_host": settings.postgres_host,
         "total_cdr_records": cdr_count,
         "debug_mode": settings.debug

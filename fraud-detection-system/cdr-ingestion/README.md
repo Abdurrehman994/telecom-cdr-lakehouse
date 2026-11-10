@@ -7,12 +7,12 @@ The CDR (Customer Detail Record) Ingestion Service is a FastAPI-based microservi
 - **Receives** customer transaction records from payment/telecom sources
 - **Validates** records with comprehensive field validation
 - **Enriches** transaction data with fraud detection flags and risk analysis
-- **Publishes** processed CDR data to RabbitMQ for downstream processing (ML Training, Analytics)
+- **Publishes** processed CDR data to Kafka for downstream processing (ML Training, Analytics)
 
 ## Architecture
 
 ```
-Transaction Sources → CDR Ingestion Service → RabbitMQ (CDR Queue) → ML Training/Analytics
+Transaction Sources → CDR Ingestion Service → Kafka (cdr-events topic) → ML Training/Analytics
                        ├─ Validation
                        ├─ Fraud Detection
                        ├─ Enrichment
@@ -25,7 +25,7 @@ Transaction Sources → CDR Ingestion Service → RabbitMQ (CDR Queue) → ML Tr
 - ✅ **Batch Processing** for efficient bulk ingestion
 - ✅ **Data Validation** with IMEI, phone number, and SIM status checks
 - ✅ **Fraud Detection** with automatic flagging based on risk scores and amounts
-- ✅ **RabbitMQ Integration** for reliable message publishing
+- ✅ **Kafka Integration** with an idempotent producer, keyed by `customer_id` so each customer's CDRs stay in order
 - ✅ **Health Checks** for service monitoring
 - ✅ **Comprehensive Logging** for debugging and monitoring
 - ✅ **Docker Support** for containerized deployment
@@ -37,18 +37,15 @@ Transaction Sources → CDR Ingestion Service → RabbitMQ (CDR Queue) → ML Tr
 - Docker and Docker Compose
 - Python 3.11+ (for local development)
 
-Create a .env file for environment settings in /cdr-ingestion directory. 
+With Docker Compose, all settings come from `../docker-compose.system.yml`. For local development, create a `.env` file in the `/cdr-ingestion` directory.
 
 Example content:
 ```
 # =========================
-# RabbitMQ Configuration
+# Kafka Configuration
 # =========================
-RABBITMQ_HOST=rabbitmq
-RABBITMQ_PORT=5672
-RABBITMQ_USER=myuser
-RABBITMQ_PASSWORD=mypassword
-RABBITMQ_QUEUE=CDR
+KAFKA_BOOTSTRAP_SERVERS=localhost:9094
+KAFKA_TOPIC=cdr-events
 
 # =========================
 # PostgreSQL Configuration
@@ -69,16 +66,18 @@ DEBUG=False
 
 ### Running with Docker Compose
 
+Run from the `fraud-detection-system` directory:
+
 ```powershell
-# Start all services (CDR Ingestion + RabbitMQ)
-docker compose up -d
+# Start CDR Ingestion + Kafka (kafka-init creates the topics)
+docker compose -f docker-compose.system.yml up -d cdr-ingestion
 
 # Check service status
-docker compose ps
+docker compose -f docker-compose.system.yml ps
 
 # View logs
-docker compose logs -f cdr-ingestion
-docker compose logs -f rabbitmq
+docker compose -f docker-compose.system.yml logs -f cdr-ingestion
+docker compose -f docker-compose.system.yml logs -f kafka
 ```
 
 ### Running Locally (Development)
@@ -201,10 +200,9 @@ cdr-ingestion/
 │   │   ├── cdr_validator.py   # Validation logic
 │   │   └── cdr_transformer.py # Transformation & enrichment
 │   └── services/
-│       └── rabbitmq_publisher.py # RabbitMQ integration
+│       └── kafka_publisher.py # Kafka integration
 ├── requirements.txt
 ├── Dockerfile
-├── docker-compose.yml
 ├── .env
 └── README.md
 ```
@@ -261,17 +259,13 @@ docker compose logs --tail 100 cdr-ingestion
 docker compose logs --timestamps cdr-ingestion
 ```
 
-### RabbitMQ Management UI
+### Kafka Topic
 
-Access the RabbitMQ management console at:
+Read the latest CDRs on the topic, with key and partition:
 
+```powershell
+docker exec kafka_1 /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic cdr-events --from-beginning --max-messages 5 --property print.key=true --property print.partition=true
 ```
-http://localhost:15672
-Username: myuser
-Password: mypassword
-```
-
-Navigate to **Queues** tab to view CDR queue statistics.
 
 ## Performance Considerations
 
@@ -291,20 +285,20 @@ For production:
 1. **Horizontal Scaling**: Run multiple instances with load balancer
 2. **Database**: Add PostgreSQL for persistence and analytics
 3. **Caching**: Add Redis for CDR caching and deduplication
-4. **Message Queue**: Scale RabbitMQ with clustering
+4. **Message Broker**: Add Kafka brokers and partitions, with replication factor 3
 
 ## Troubleshooting
 
-### RabbitMQ Connection Issues
+### Kafka Connection Issues
 
 ```
-Error: Failed to connect to RabbitMQ
+Error: Failed to connect to Kafka
 
 Solutions:
-1. Verify RabbitMQ container is running: docker compose ps
-2. Check environment variables in .env
-3. Verify network: docker network ls
-4. Check RabbitMQ logs: docker compose logs rabbitmq
+1. Verify the kafka container is healthy: docker compose -f docker-compose.system.yml ps
+2. Verify kafka-init exited with code 0 (it creates the cdr-events topic)
+3. Check KAFKA_BOOTSTRAP_SERVERS (kafka:9092 in Docker, localhost:9094 from the host)
+4. Check Kafka logs: docker compose -f docker-compose.system.yml logs kafka
 ```
 
 ### Service Not Starting
@@ -325,17 +319,17 @@ docker compose up cdr-ingestion
 
 - Reduce batch size
 - Enable debug logging selectively
-- Monitor RabbitMQ queue depth
+- Monitor Kafka consumer lag
 
 ## Integration with Other Services
 
 ### Stream Processing
-- Consumes from CDR queue
+- Consumes from the cdr-events topic
 - Applies streaming transformations
-- Publishes to analytics queue
+- Publishes to an analytics topic
 
 ### ML Training
-- Consumes from CDR queue
+- Consumes from the cdr-events topic (consumer group `fraud-detection`)
 - Extracts features for model training
 - Updates fraud detection models
 

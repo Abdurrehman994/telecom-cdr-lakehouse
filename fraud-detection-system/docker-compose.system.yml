@@ -169,16 +169,8 @@ services:
     ports:
       - "8080:8080"
     environment:
-      RABBITMQ_HOST: rabbitmq
-      RABBITMQ_PORT: 5672
-      RABBITMQ_DEFAULT_USER: myuser
-      RABBITMQ_DEFAULT_PASS: mypassword
-      RABBITMQ_USER: myuser
-      RABBITMQ_PASSWORD: mypassword
-      RABBITMQ_QUEUE: CDR
       SERVICE_NAME: cdr-ingestion
       SERVICE_VERSION: 2.0.0
-      CDR_QUEUE_NAME: CDR
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: cdr-events
       POSTGRES_HOST: postgres
@@ -188,8 +180,6 @@ services:
       POSTGRES_DB: cdr_database
       DEBUG: "False"
     depends_on:
-      rabbitmq:
-        condition: service_healthy
       kafka-init:
         condition: service_completed_successfully
       # postgres:
@@ -252,30 +242,6 @@ services:
       - fraud-detection-network
     restart: "no"
 
-  rabbitmq:
-    image: rabbitmq:3-management
-    container_name: rabbitmq_1
-    hostname: rabbitmq
-    ports:
-      - "5672:5672"     # AMQP
-      - "15672:15672"   # Management UI
-    environment:
-      RABBITMQ_DEFAULT_USER: myuser
-      RABBITMQ_DEFAULT_PASS: mypassword
-    command: >
-      bash -c "
-      rabbitmq-plugins enable --offline rabbitmq_prometheus &&
-      rabbitmq-server
-      "
-    healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    networks:
-      - fraud-detection-network
-    restart: unless-stopped
-
   # postgres:
   #   image: postgres:15-alpine
   #   container_name: postgres_1
@@ -296,24 +262,6 @@ services:
   #   restart: unless-stopped
   #   volumes:
   #     - postgres_data:/var/lib/postgresql/data
-
-  # example_consumer_1:
-  #   build:
-  #     context: ./rabbit/
-  #     dockerfile: Dockerfile.consumer
-  #     # args: 
-  #     #   - 
-  #   container_name: example_consumer_1
-  #   depends_on:
-  #     rabbitmq:
-  #       condition: service_healthy
-  #   environment:
-  #     RABBITMQ_HOST: rabbitmq
-  #     RABBITMQ_DEFAULT_USER: myuser
-  #     RABBITMQ_DEFAULT_PASS: mypassword
-  #   command: ["python", "-u", "main.py"]
-  #   networks:
-  #     - fraud-detection-network
 
 volumes:
   kafka-data:

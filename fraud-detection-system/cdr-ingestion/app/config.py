@@ -6,13 +6,6 @@ from pydantic_settings import BaseSettings
 class Settings(BaseSettings):
     """Application settings from environment variables - do not expose sensitive values"""
     
-    # RabbitMQ Configuration
-    rabbitmq_host: str = Field(..., description="RabbitMQ host from RABBITMQ_HOST env var")
-    rabbitmq_port: int = Field(..., description="RabbitMQ port from RABBITMQ_PORT env var")
-    rabbitmq_user: str = Field(..., description="RabbitMQ username from RABBITMQ_USER env var")
-    rabbitmq_password: str = Field(..., description="RabbitMQ password from RABBITMQ_PASSWORD env var")
-    rabbitmq_queue: str = Field(..., description="RabbitMQ queue from RABBITMQ_QUEUE env var")
-    
     # Kafka Configuration
     kafka_bootstrap_servers: str = Field("kafka:9092", description="Kafka brokers from KAFKA_BOOTSTRAP_SERVERS env var")
     kafka_topic: str = Field("cdr-events", description="Kafka topic from KAFKA_TOPIC env var")

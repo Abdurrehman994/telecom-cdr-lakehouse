@@ -66,35 +66,7 @@ ALERTMANAGER_EMAIL_PASSWORD=your-app-password
 ```
 
 
-Create a .env file for environment settings in ´/fraud-detection-system/cdr-ingestion´ directory. 
-
-Example content:
-```
-# =========================
-# RabbitMQ Configuration
-# =========================
-RABBITMQ_HOST=rabbitmq
-RABBITMQ_PORT=5672
-RABBITMQ_USER=myuser
-RABBITMQ_PASSWORD=mypassword
-RABBITMQ_QUEUE=CDR
-
-# =========================
-# PostgreSQL Configuration
-# =========================
-POSTGRES_HOST=postgres
-POSTGRES_PORT=5432
-POSTGRES_USER=myuser
-POSTGRES_PASSWORD=mypassword
-POSTGRES_DB=cdr_database
-
-# =========================
-# Service Configuration
-# =========================
-SERVICE_NAME=SERVICE
-SERVICE_VERSION=1.0
-DEBUG=False
-```
+The CDR ingestion and ML services need no `.env` file: their Kafka, service and database settings are set in `docker-compose.system.yml`.
 
 ---
 
@@ -176,10 +148,6 @@ Open your web browser and navigate to:
 2. Enter your credentials
 3. You'll see the Grafana home page
 
-**RabbitMQ Dashboard**
-- Add prometheus as data source
-- Create dashboard wit template id: 10991
-
 ### Prometheus
 - **URL**: http://localhost:9090
 - **Check targets**: http://localhost:9090/targets
@@ -197,8 +165,14 @@ Open your web browser and navigate to:
 - **URL**: http://localhost:8080/docs
 - Run payloads to service
 
-### RabbitMQ Administration
-- **URL**: http://localhost:15672/
+### Kafka
+- **Broker from the host**: `localhost:9094` (containers use `kafka:9092`)
+- **Topics**: `cdr-events` (3 partitions, keyed by `customer_id`), `cdr-events-dlq` (messages that failed processing)
+- **Consumer group**: `fraud-detection` (`ml-service` and `ml-service2` share the partitions)
+- **Check consumer lag**:
+  ```bash
+  docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group fraud-detection
+  ```
 
 #### NOTE
 Use the docker compose file `docker-compose.system.yml` as a reference for default ports and credentials.
