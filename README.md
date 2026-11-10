@@ -5,6 +5,8 @@
 > Nabeel Hussain, Muhammad Abdur Rehman, Christoph Gasche, Marko Tiitto and Talha Pasha.
 > Work from November 2026 onward is by Muhammad Abdur Rehman.
 
+CDRs stream through Kafka into real-time fraud detection and an Apache Iceberg lakehouse. For the design, trade-offs and production roadmap, see [docs/architecture.md](docs/architecture.md).
+
 ## Table of Contents
 - [Prerequisites](#prerequisites)
 - [Initial Setup](#initial-setup)
