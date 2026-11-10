@@ -60,7 +60,7 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 
 ## Data flow
 
-1. **Ingest.** A client posts a CDR to `/ingest` or `/ingest/batch`. The service validates it, adds `processed_timestamp` and simple risk flags, and produces it to `cdr-events` with `customer_id` as the key.
+1. **Ingest.** A client posts a CDR to `/ingest` or `/ingest/batch`. The service validates it, adds `processed_timestamp` and simple risk flags, and produces it to `cdr-events` with `customer_id` as the key. It answers only after the broker confirms the write.
 2. **Partition.** Kafka hashes the key, so all CDRs of one customer land in the same partition, in the order they were produced.
 3. **Detect fraud.** The `fraud-detection` group splits the 3 partitions between the two `ml-service` replicas. Each CDR goes through rules, a random forest score, and the LLM if the score is uncertain. A fraud decision is stored in Postgres; if the row is new, Alertmanager is notified. Analysts list alerts and record decisions (`confirmed`, `dismissed`) through the alerts API.
 4. **Write to the lakehouse.** The `lakehouse-writer` group reads the same partitions independently. It buffers rows and appends a batch to Iceberg every 500 rows or 10 seconds. Each append creates a new snapshot.
@@ -104,6 +104,13 @@ Kafka offsets and Iceberg data live in different systems, so committing them sep
 The writer closes that gap by storing the offsets **inside the Iceberg commit**, as the snapshot property `kafka.cdr-events.offsets`. Data and position are committed atomically. When partitions are assigned, the writer reads that property and seeks there, ignoring Kafka's own committed offsets. It then commits the same offsets back to Kafka, only so that consumer lag reports correctly.
 
 This was tested by rewinding the writer's Kafka offsets to 0 and restarting it: it resumed at offsets 248, 328 and 225 from Iceberg and wrote no duplicates.
+
+A later test found a gap anyway. With the broker stopped, the writer appended a batch to Iceberg and then blocked on the Kafka offset commit. While it waited, the consumer session timed out, the revoke callback ran `flush()` again, and the batch was still in the buffer, so the same 3 rows were appended twice. The commit then failed and the writer crashed. Two changes closed it:
+
+- The buffer is cleared as soon as the Iceberg append succeeds, before the Kafka commit, and a failed Kafka commit is logged instead of raised. The Kafka commit only feeds lag reporting, so it should never stop the writer.
+- Before each append the writer drops rows whose offset is below what Iceberg already stores for that partition. An append is then idempotent against the table's own state, whatever the bug that re-sends it.
+
+Repeating the same broker outage after the fix: the commit failure was logged, the partitions were revoked and reassigned, the writer did not restart, and no new duplicates were written.
 
 ### Batched appends
 
@@ -152,7 +159,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Kafka → fraud detection | At least once | Offset stored only after processing |
 | Fraud decision → alert | Effectively once per transaction | `transaction_id` primary key, `ON CONFLICT DO NOTHING`, notify only on insert |
 | Kafka → Iceberg | Exactly once | Offsets committed in the same Iceberg snapshot as the data |
-| HTTP client → Kafka | **At most once** (see limitations) | `produce()` is asynchronous; the API answers before the broker confirms |
+| HTTP client → Kafka | At least once, if the client retries | The API waits for the broker's delivery report: `202` only after the CDR is stored, `503` (or a per-record error in a batch) if it is not |
 
 ## Failure scenarios
 
@@ -165,7 +172,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Ollama unavailable | Uncertain cases fall back to the random forest score. |
 | Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
 | A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
-| The Kafka broker stops | Producers buffer, then fail; consumers wait. With one broker this is an outage; replication would prevent it. |
+| The Kafka broker stops | Ingestion answers `503` after about 10 seconds, so clients know to retry; consumers wait and rejoin their groups when it returns. Tested: no messages lost, no duplicate rows, no writer restart. With one broker this is an outage; replication would prevent it. |
 
 ## Data model
 
@@ -189,7 +196,7 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 
 ## Known limitations
 
-- **The HTTP API can lose a CDR.** `/ingest` returns `202 Accepted` before Kafka confirms the write, and logs publish failures instead of returning an error. A broker outage at that moment loses the record. Fix: wait for the delivery report (or `flush`) before responding, and return `503` on failure.
+- **A client retry can duplicate a CDR in Kafka.** The API now waits for the broker before answering, so a CDR is no longer lost silently. But if the broker stores a CDR after the API has given up waiting (10 seconds), the client sees an error, retries, and the CDR is produced twice. Fraud alerts are deduplicated by `transaction_id`; the Iceberg table is not, so analytical queries should count distinct `transaction_id`, or a deduplicated table should be built from it.
 - **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
 - **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
 - **One lakehouse writer.** The offset merge assumes a single writer. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.

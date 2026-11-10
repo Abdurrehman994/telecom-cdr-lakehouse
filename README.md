@@ -1,11 +1,27 @@
-# Telecom Fraud Detection & Prevention System - Setup Guide
+# Telecom CDR Streaming Lakehouse
 
 > This repository continues a University of Oulu group project
 > ([original repo](https://github.com/FastByte17/DS_Project_2026)) built by
 > Nabeel Hussain, Muhammad Abdur Rehman, Christoph Gasche, Marko Tiitto and Talha Pasha.
 > Work from November 2026 onward is by Muhammad Abdur Rehman.
 
-CDRs stream through Kafka into real-time fraud detection and an Apache Iceberg lakehouse. For the design, trade-offs and production roadmap, see [docs/architecture.md](docs/architecture.md).
+Call detail records (CDRs) stream through Kafka into two independent consumers: real-time fraud detection and an Apache Iceberg lakehouse.
+
+```text
+HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
+                            ├─► ml-service ×2 ─► Postgres (fraud_alerts) ─► Alertmanager
+                            └─► lakehouse-writer ─► Iceberg on S3 (SeaweedFS) ─► DuckDB
+```
+
+## Highlights
+
+- **Exactly-once into Iceberg.** Kafka offsets are stored in the same Iceberg snapshot as the data, so a crash or an offset reset never duplicates or loses rows.
+- **Idempotent fraud alerts.** Alerts are keyed by `transaction_id`, so replaying the topic creates no duplicate alerts or notifications.
+- **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
+- **Failure handling.** A dead-letter topic for bad messages, retries with backoff when Postgres is down, and consumer rebalancing when a replica stops. Each was tested.
+- **OLTP and OLAP side by side.** Postgres for alert case management, Iceberg and DuckDB for analytics and snapshot time travel.
+
+For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md).
 
 ## Table of Contents
 - [Prerequisites](#prerequisites)
@@ -34,16 +50,9 @@ Before you begin, ensure you have the following installed:
 
 ### 1. Clone the Repository
 
-#### Windows (PowerShell or Command Prompt):
-```powershell
-git clone https://github.com/FastByte17/DS_Project_2026
-cd fraud-detection-system
-```
-
-#### Linux/Mac (Terminal):
 ```bash
-git clone https://github.com/FastByte17/DS_Project_2026
-cd fraud-detection-system
+git clone https://github.com/Abdurrehman994/telecom-cdr-lakehouse
+cd telecom-cdr-lakehouse/fraud-detection-system
 ```
 
 ---
@@ -63,7 +72,7 @@ To override them, copy `fraud-detection-system/.env.example` to `fraud-detection
 
 ## Starting the Stack
 
-### 4. Validate Configuration
+### 3. Validate Configuration
 
 Before starting, validate your docker-compose file:
 
@@ -73,7 +82,7 @@ docker compose -f docker-compose.system.yml config
 
 If there are no errors, you'll see the parsed configuration.
 
-### 5. Start All Services
+### 4. Start All Services
 
 ```bash
 docker compose -f docker-compose.system.yml up -d
@@ -93,7 +102,7 @@ You can stop the service with:
 docker compose -f docker-compose.system.yml down
 ```
 
-### 6. Verify Services Are Running
+### 5. Verify Services Are Running
 
 ```bash
 docker container ps
@@ -108,13 +117,13 @@ CONTAINER ID   IMAGE                                  COMMAND                  C
 ...
 ```
 
-### 7. Add Llama3.2 model to OLlama container
+### 6. Add Llama3.2 model to OLlama container
 
 ```bash
 docker exec -it fraud-detection-ollama ollama pull llama3.2
 ```
 
-### (Optional) 8. Run a example payload to the service
+### (Optional) 7. Run a example payload to the service
 
 Go to /fraud-detection-system/ingest-auto/
 
@@ -345,4 +354,4 @@ TBD
 
 ---
 
-**Last Updated**: March 2026
+**Last Updated**: November 2026
