@@ -3,6 +3,9 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
+# Write print() output to the container logs immediately instead of buffering it
+ENV PYTHONUNBUFFERED=1
+
 # Copy requirements first (for better caching)
 COPY requirements.txt .
 

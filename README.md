@@ -165,6 +165,15 @@ Open your web browser and navigate to:
   docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group fraud-detection
   ```
 
+### Fraud Alerts (Postgres)
+- **Database**: `localhost:5432`, database `cdr_database`, table `fraud_alerts` (schema in `fraud-detection-system/postgres/init/`)
+- **List open alerts**: http://localhost:8001/alerts?status=open
+- **Record a decision**:
+  ```bash
+  curl -X PATCH http://localhost:8001/alerts/<transaction_id> -H "Content-Type: application/json" -d '{"status": "confirmed", "note": "verified with customer"}'
+  ```
+- Each transaction has at most one alert, so replaying Kafka never duplicates alerts or notifications
+
 ### Lakehouse (Apache Iceberg)
 - **Flow**: `lakehouse-writer` reads `cdr-events` as its own consumer group (`lakehouse-writer`) and appends CDRs in batches to the Iceberg table `telecom.cdr_events`, partitioned by day
 - **Storage**: SeaweedFS (S3 API at http://localhost:8333), bucket `warehouse`, Parquet data files

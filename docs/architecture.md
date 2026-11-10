@@ -28,7 +28,8 @@ flowchart LR
     T -->|group: fraud-detection| ML2[ml-service2]
     T -->|group: lakehouse-writer| LW[lakehouse-writer]
 
-    ML1 & ML2 -->|alerts| AM[Alertmanager]
+    ML1 & ML2 -->|store alert| PG[(Postgres<br/>fraud_alerts)]
+    ML1 & ML2 -->|new alerts only| AM[Alertmanager]
     ML1 & ML2 -.->|uncertain cases| OL[Ollama LLM]
     ML1 & ML2 & LW -->|unprocessable| DLQ[(cdr-events-dlq)]
 
@@ -49,7 +50,8 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 | `cdr-ingestion` | Python, FastAPI, `confluent-kafka` | Validates and enriches CDRs received over HTTP, publishes them to Kafka |
 | `kafka` | Apache Kafka 3.9.1, KRaft mode | Durable, ordered, replayable event log |
 | `kafka-init` | One-shot container | Creates `cdr-events` (3 partitions) and `cdr-events-dlq` (1 partition); automatic topic creation is disabled |
-| `ml-service`, `ml-service2` | Python, scikit-learn, Ollama | Fraud detection: rules, then a random forest, then an LLM for uncertain cases |
+| `ml-service`, `ml-service2` | Python, scikit-learn, Ollama | Fraud detection: rules, then a random forest, then an LLM for uncertain cases. Also serves the alerts API (`/alerts`) |
+| `postgres` | PostgreSQL 15 | OLTP store for fraud alerts and their case status; schema in `postgres/init/` |
 | `lakehouse-writer` | Python, PyIceberg, PyArrow | Streams CDRs into the Iceberg table `telecom.cdr_events` |
 | `iceberg-rest` | Apache Iceberg REST catalog 1.9.1 | Tracks the current metadata file of each table; state kept in SQLite on a volume |
 | `seaweedfs` | SeaweedFS 4.51 | S3-compatible object storage for Parquet data and Iceberg metadata |
@@ -60,7 +62,7 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 
 1. **Ingest.** A client posts a CDR to `/ingest` or `/ingest/batch`. The service validates it, adds `processed_timestamp` and simple risk flags, and produces it to `cdr-events` with `customer_id` as the key.
 2. **Partition.** Kafka hashes the key, so all CDRs of one customer land in the same partition, in the order they were produced.
-3. **Detect fraud.** The `fraud-detection` group splits the 3 partitions between the two `ml-service` replicas. Each CDR goes through rules, a random forest score, and the LLM if the score is uncertain. Fraud raises an alert in Alertmanager.
+3. **Detect fraud.** The `fraud-detection` group splits the 3 partitions between the two `ml-service` replicas. Each CDR goes through rules, a random forest score, and the LLM if the score is uncertain. A fraud decision is stored in Postgres; if the row is new, Alertmanager is notified. Analysts list alerts and record decisions (`confirmed`, `dismissed`) through the alerts API.
 4. **Write to the lakehouse.** The `lakehouse-writer` group reads the same partitions independently. It buffers rows and appends a batch to Iceberg every 500 rows or 10 seconds. Each append creates a new snapshot.
 5. **Analyse.** `query.py` loads the current snapshot (or an earlier one) and runs SQL with DuckDB.
 
@@ -107,6 +109,27 @@ This was tested by rewinding the writer's Kafka offsets to 0 and restarting it: 
 
 Every Iceberg append writes new Parquet files and a new snapshot. Writing one row per append would create thousands of tiny files and slow down every query. The writer batches up to 500 rows or 10 seconds, trading a little latency for far fewer files.
 
+### Postgres for alerts, Iceberg for history (OLTP and OLAP)
+
+The two stores answer different questions:
+
+| | Postgres (`fraud_alerts`) | Iceberg (`telecom.cdr_events`) |
+|---|---|---|
+| Workload | OLTP: read and update one alert at a time | OLAP: scan and aggregate millions of CDRs |
+| Typical query | "Open alerts, newest first"; "mark this alert confirmed" | "Fraud amount per type per day this year" |
+| Access pattern | Primary key and index lookups, row updates | Columnar scans of Parquet files, partition pruning |
+| Data | Only fraud decisions, mutable (status changes) | Every CDR, append-only, with snapshots |
+
+Putting alerts in Iceberg would turn every status change into a new snapshot and file rewrite. Putting CDR history in Postgres would make large scans slow and storage expensive. Each store does what it is built for.
+
+### Idempotent alerts
+
+At-least-once delivery means a CDR can be processed twice: after a crash, a rebalance or a deliberate replay. The `fraud_alerts` table uses `transaction_id` as its primary key, and alerts are inserted with `ON CONFLICT DO NOTHING`. The insert reports whether the row is new, and only new alerts reach Alertmanager. Replaying the whole topic therefore produces no duplicate rows and no repeated notifications.
+
+Tested by replaying all CDRs twice: the second replay recognised 648 alerts as already stored and created no duplicate rows.
+
+A Postgres outage is treated differently from a bad message. The CDR is valid, so instead of going to the DLQ, the consumer retries with backoff and the partition waits. Tested by stopping Postgres, sending a fraud CDR, and restarting Postgres: the alert was stored about 3 seconds after the database came back.
+
 ### Dead-letter topic
 
 A message that cannot be parsed or processed goes to `cdr-events-dlq`, with headers for the error, the source partition and the source offset. The consumer then moves on, so one bad message cannot block a whole partition, and nothing is silently dropped.
@@ -127,6 +150,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 |---|---|---|
 | Producer → Kafka | No duplicates or reordering from retries | `enable.idempotence=true`, `acks=all` |
 | Kafka → fraud detection | At least once | Offset stored only after processing |
+| Fraud decision → alert | Effectively once per transaction | `transaction_id` primary key, `ON CONFLICT DO NOTHING`, notify only on insert |
 | Kafka → Iceberg | Exactly once | Offsets committed in the same Iceberg snapshot as the data |
 | HTTP client → Kafka | **At most once** (see limitations) | `produce()` is asynchronous; the API answers before the broker confirms |
 
@@ -139,6 +163,8 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | `lakehouse-writer` crashes mid-batch | Unflushed rows were never committed to Iceberg, so on restart it reads them again from the last stored offsets. No loss, no duplicates. |
 | Kafka offsets lost or rewound | The writer ignores them and resumes from Iceberg. Tested by resetting the group to offset 0. |
 | Ollama unavailable | Uncertain cases fall back to the random forest score. |
+| Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
+| A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
 | The Kafka broker stops | Producers buffer, then fail; consumers wait. With one broker this is an outage; replication would prevent it. |
 
 ## Data model
@@ -164,8 +190,8 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 ## Known limitations
 
 - **The HTTP API can lose a CDR.** `/ingest` returns `202 Accepted` before Kafka confirms the write, and logs publish failures instead of returning an error. A broker outage at that moment loses the record. Fix: wait for the delivery report (or `flush`) before responding, and return `503` on failure.
-- **Duplicate fraud alerts on replay.** At-least-once processing means a reprocessed CDR can raise its alert twice. Fix: use `transaction_id` as an idempotency key where alerts are stored.
-- **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. A shared model registry and offline training from the lakehouse would fix both.
+- **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
+- **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
 - **One lakehouse writer.** The offset merge assumes a single writer. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
 - **No table maintenance.** Small files and old snapshots accumulate. Compaction and snapshot expiry need to run on a schedule.
 - **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication.
@@ -183,7 +209,7 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 | Query engine | DuckDB, in memory | Trino or Spark for large scans; DuckDB for local analysis |
 | Lakehouse writes | Python writer | Kafka Connect Iceberg sink or Flink, for higher throughput |
 | Table maintenance | None | Scheduled compaction, snapshot expiry and orphan file cleanup |
-| OLTP | Postgres disabled | Postgres for fraud alerts and case handling (fast single-row reads and updates) |
+| OLTP | One Postgres container, schema from an init script | Managed Postgres with replicas and backups; schema migrations with a tool such as Alembic or Flyway |
 | Monitoring | Prometheus, Alertmanager | Plus consumer lag alerts per group, DLQ rate, and writer commit latency |
 | Deployment | Docker Compose | Kubernetes, with Kafka run by an operator such as Strimzi |
 | Secrets | Defaults in Compose | A secret manager; no defaults outside local development |

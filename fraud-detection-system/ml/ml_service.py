@@ -4,19 +4,24 @@ import threading
 import time
 import numpy as np
 from collections import deque
-from typing import Dict, List
+from typing import Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, generate_latest, REGISTRY
 from fastapi.responses import Response
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool, PoolTimeout
 import os
 
 # prometheus metrics
 fraud_detected = Counter('fraud_detected_total', 'Frauds detected', ['method', 'fraud_type'])
 llm_latency = Histogram('llm_analysis_duration_seconds', 'LLM analysis time')
 cdr_processed = Counter('cdr_processed_total', 'Total CDRs processed', ['status'])
+duplicate_alerts_skipped = Counter('duplicate_alerts_skipped_total', 'Redelivered CDRs whose alert was already stored')
 
 # FastAPI app
 app = FastAPI(title="ML Fraud Detection Service")
@@ -292,6 +297,94 @@ Analysis:"""
 # initialize detector
 detector = FraudDetectionEngine()
 
+# postgres alert store (OLTP)
+class AlertStore:
+    """stores fraud alerts and their case status in postgres.
+
+    transaction_id is the primary key, so save() is idempotent: a CDR that
+    kafka delivers twice produces one row and one alert.
+    """
+    def __init__(self):
+        self.pool = ConnectionPool(
+            open=False,
+            min_size=1,
+            max_size=4,
+            kwargs={
+                "host": os.getenv("POSTGRES_HOST", "postgres"),
+                "port": os.getenv("POSTGRES_PORT", "5432"),
+                "dbname": os.getenv("POSTGRES_DB", "cdr_database"),
+                "user": os.getenv("POSTGRES_USER", "fraud_user"),
+                "password": os.getenv("POSTGRES_PASSWORD", ""),
+                "row_factory": dict_row,
+            },
+        )
+
+    def open(self):
+        """connect to postgres, retrying until it is up"""
+        while True:
+            try:
+                self.pool.open(wait=True, timeout=10)
+                print("connected to postgres alert store")
+                return
+            except PoolTimeout as e:
+                print(f"postgres not ready ({e}), retrying...")
+
+    def save(self, cdr: Dict, result: Dict, partition: int, offset: int) -> bool:
+        """insert the alert; returns True if it is new, False if it already existed"""
+        with self.pool.connection() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO fraud_alerts (
+                    transaction_id, customer_id, mobile_number, fraud_type, method,
+                    confidence, explanation, amount_eur, event_time,
+                    kafka_partition, kafka_offset
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::timestamptz, %s, %s)
+                ON CONFLICT (transaction_id) DO NOTHING
+                """,
+                (
+                    cdr.get('transaction_id'), cdr.get('customer_id'), cdr.get('mobile_number'),
+                    result.get('fraud_type'), result.get('method'), result.get('confidence'),
+                    result.get('explanation'), cdr.get('amount_eur'), cdr.get('time_stamp'),
+                    partition, offset,
+                ),
+            )
+            return cur.rowcount == 1
+
+    def list(self, status: Optional[str], limit: int) -> List[Dict]:
+        with self.pool.connection() as conn:
+            if status:
+                return conn.execute(
+                    "SELECT * FROM fraud_alerts WHERE status = %s ORDER BY detected_at DESC LIMIT %s",
+                    (status, limit),
+                ).fetchall()
+            return conn.execute(
+                "SELECT * FROM fraud_alerts ORDER BY detected_at DESC LIMIT %s", (limit,)
+            ).fetchall()
+
+    def get(self, transaction_id: str) -> Optional[Dict]:
+        with self.pool.connection() as conn:
+            return conn.execute(
+                "SELECT * FROM fraud_alerts WHERE transaction_id = %s", (transaction_id,)
+            ).fetchone()
+
+    def update_status(self, transaction_id: str, status: str, note: Optional[str]) -> Optional[Dict]:
+        with self.pool.connection() as conn:
+            return conn.execute(
+                """
+                UPDATE fraud_alerts
+                SET status = %s, analyst_note = coalesce(%s, analyst_note), updated_at = now()
+                WHERE transaction_id = %s
+                RETURNING *
+                """,
+                (status, note, transaction_id),
+            ).fetchone()
+
+    def close(self):
+        self.pool.close()
+
+alert_store = AlertStore()
+
 # kafka Consumer
 class CDRConsumer:
     """reads CDRs from a kafka topic as part of a consumer group.
@@ -373,9 +466,11 @@ class CDRConsumer:
                 print(f"   Confidence: {result.get('confidence'):.2%}")
                 print(f"   Method: {result.get('method')}")
                 print(f"   Explanation: {result.get('explanation')}")
-                
-                # send alert
-                send_alert_to_prometheus(cdr, result)
+
+                if not self.record_alert(cdr, result, msg):
+                    # stopping before the alert was stored: leave the offset
+                    # unstored so this CDR is processed again after restart
+                    return
                 cdr_processed.labels(status='fraud').inc()
             else:
                 print(f"clean transaction")
@@ -389,6 +484,32 @@ class CDRConsumer:
 
         # mark as done; the next auto-commit saves this position
         self.consumer.store_offsets(message=msg)
+
+    def record_alert(self, cdr, result, msg) -> bool:
+        """store the alert in postgres and notify alertmanager if it is new.
+
+        a postgres outage is temporary, so the partition waits and retries
+        instead of sending a valid CDR to the DLQ. returns False only if the
+        consumer is stopping before the alert could be stored.
+        """
+        delay = 1
+        while self.running:
+            try:
+                is_new = alert_store.save(cdr, result, msg.partition(), msg.offset())
+                break
+            except (psycopg.OperationalError, PoolTimeout) as e:
+                print(f"postgres unavailable ({e}), retrying in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+        else:
+            return False
+
+        if is_new:
+            send_alert_to_prometheus(cdr, result)
+        else:
+            print(f"alert for {cdr.get('transaction_id')} already stored, not alerting again")
+            duplicate_alerts_skipped.inc()
+        return True
 
     def start_consuming(self):
         """poll kafka until stop() is called"""
@@ -466,6 +587,8 @@ async def startup_event():
     consumer = CDRConsumer()
 
     def start_consumer():
+        # alerts are written to postgres, so it must be reachable before consuming
+        alert_store.open()
         if consumer.connect():
             consumer.start_consuming()
 
@@ -480,6 +603,7 @@ async def shutdown_event():
     if consumer:
         consumer.stop()
         time.sleep(2)
+    alert_store.close()
 
 @app.post("/detect")
 async def detect_fraud_endpoint(cdr: Dict):
@@ -493,6 +617,31 @@ async def detect_fraud_endpoint(cdr: Dict):
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+class AlertUpdate(BaseModel):
+    status: Literal['open', 'confirmed', 'dismissed']
+    note: Optional[str] = None
+
+@app.get("/alerts")
+def list_alerts(status: Optional[Literal['open', 'confirmed', 'dismissed']] = None, limit: int = 50):
+    """list fraud alerts, newest first, optionally filtered by status"""
+    return alert_store.list(status, max(1, min(limit, 500)))
+
+@app.get("/alerts/{transaction_id}")
+def get_alert(transaction_id: str):
+    """get one fraud alert"""
+    alert = alert_store.get(transaction_id)
+    if alert is None:
+        raise HTTPException(status_code=404, detail=f"no alert for {transaction_id}")
+    return alert
+
+@app.patch("/alerts/{transaction_id}")
+def update_alert(transaction_id: str, update: AlertUpdate):
+    """record an analyst's decision on an alert"""
+    alert = alert_store.update_status(transaction_id, update.status, update.note)
+    if alert is None:
+        raise HTTPException(status_code=404, detail=f"no alert for {transaction_id}")
+    return alert
 
 @app.get("/health")
 async def health():
@@ -528,6 +677,7 @@ async def root():
         "kafka": f"consuming from {consumer.topic if consumer else 'cdr-events'}",
         "endpoints": {
             "detect": "POST /detect (manual testing)",
+            "alerts": "GET /alerts?status=open, GET/PATCH /alerts/{transaction_id}",
             "health": "GET /health",
             "metrics": "GET /metrics"
         }

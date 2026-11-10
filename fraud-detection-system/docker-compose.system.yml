@@ -127,9 +127,16 @@ services:
       KAFKA_TOPIC: cdr-events
       KAFKA_GROUP_ID: fraud-detection
       KAFKA_DLQ_TOPIC: cdr-events-dlq
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: cdr_database
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud-dev-password}
     depends_on:
       kafka-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
       ollama:
         condition: service_started
       prometheus:
@@ -149,9 +156,16 @@ services:
       KAFKA_TOPIC: cdr-events
       KAFKA_GROUP_ID: fraud-detection
       KAFKA_DLQ_TOPIC: cdr-events-dlq
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: cdr_database
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud-dev-password}
     depends_on:
       kafka-init:
         condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
       ollama:
         condition: service_started
       prometheus:
@@ -175,15 +189,13 @@ services:
       KAFKA_TOPIC: cdr-events
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
-      POSTGRES_USER: fraud_user
-      POSTGRES_PASSWORD: SecureDBPassword456!
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud-dev-password}
       POSTGRES_DB: cdr_database
       DEBUG: "False"
     depends_on:
       kafka-init:
         condition: service_completed_successfully
-      # postgres:
-      #   condition: service_healthy
     networks:
       - fraud-detection-network
     restart: unless-stopped
@@ -326,26 +338,28 @@ services:
       - fraud-detection-network
     restart: unless-stopped
 
-  # postgres:
-  #   image: postgres:15-alpine
-  #   container_name: postgres_1
-  #   hostname: postgres
-  #   ports:
-  #     - "5432:5432"
-  #   environment:
-  #     POSTGRES_USER: fraud_user
-  #     POSTGRES_PASSWORD: SecureDBPassword456!
-  #     POSTGRES_DB: cdr_database
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "pg_isready -U fraud_user"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-  #   networks:
-  #     - fraud-detection-network
-  #   restart: unless-stopped
-  #   volumes:
-  #     - postgres_data:/var/lib/postgresql/data
+  # OLTP database: fraud alerts and case status (schema in ./postgres/init)
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres_1
+    hostname: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud-dev-password}
+      POSTGRES_DB: cdr_database
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d cdr_database"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
 
 volumes:
   kafka-data:
