@@ -1,0 +1,3 @@
+confluent-kafka==2.6.1
+pyiceberg[pyarrow]==0.9.1
+duckdb==1.2.2

@@ -242,6 +242,90 @@ services:
       - fraud-detection-network
     restart: "no"
 
+  # S3-compatible object storage for the lakehouse (Parquet data + Iceberg metadata)
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.51
+    container_name: seaweedfs_1
+    hostname: seaweedfs
+    ports:
+      - "8333:8333"     # S3 API
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY:-lakehouse}
+      S3_SECRET_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        cat > /tmp/s3.json <<EOF
+        {"identities": [{"name": "lakehouse",
+          "credentials": [{"accessKey": "$$S3_ACCESS_KEY", "secretKey": "$$S3_SECRET_KEY"}],
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+        EOF
+        exec weed server -dir=/data -ip=seaweedfs -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024 -s3 -s3.port=8333 -s3.config=/tmp/s3.json
+    volumes:
+      - seaweedfs-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:9333/cluster/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # Iceberg REST catalog: tracks which metadata file is the current version of each table
+  iceberg-rest:
+    image: apache/iceberg-rest-fixture:1.9.1
+    container_name: iceberg_rest_1
+    hostname: iceberg-rest
+    user: root
+    ports:
+      - "8181:8181"
+    environment:
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+      # catalog state in SQLite on a volume, so tables survive restarts
+      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
+      AWS_REGION: us-east-1
+    volumes:
+      - iceberg-catalog:/catalog
+    depends_on:
+      seaweedfs:
+        condition: service_healthy
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # Streams cdr-events into the Iceberg table telecom.cdr_events
+  lakehouse-writer:
+    build: ./lakehouse/
+    container_name: lakehouse_writer_1
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: cdr-events
+      KAFKA_GROUP_ID: lakehouse-writer
+      KAFKA_DLQ_TOPIC: cdr-events-dlq
+      ICEBERG_CATALOG_URI: http://iceberg-rest:8181
+      ICEBERG_TABLE: telecom.cdr_events
+      S3_ENDPOINT: http://seaweedfs:8333
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
+      S3_BUCKET: warehouse
+      FLUSH_MAX_RECORDS: 500
+      FLUSH_INTERVAL_SECONDS: 10
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
   # postgres:
   #   image: postgres:15-alpine
   #   container_name: postgres_1
@@ -265,6 +349,8 @@ services:
 
 volumes:
   kafka-data:
+  seaweedfs-data:
+  iceberg-catalog:
   prometheus-data:
   grafana-data:
   alertmanager-data:

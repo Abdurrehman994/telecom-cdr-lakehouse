@@ -174,6 +174,16 @@ Open your web browser and navigate to:
   docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group fraud-detection
   ```
 
+### Lakehouse (Apache Iceberg)
+- **Flow**: `lakehouse-writer` reads `cdr-events` as its own consumer group (`lakehouse-writer`) and appends CDRs in batches to the Iceberg table `telecom.cdr_events`, partitioned by day
+- **Storage**: SeaweedFS (S3 API at http://localhost:8333), bucket `warehouse`, Parquet data files
+- **Catalog**: Iceberg REST catalog at http://localhost:8181
+- **Exactly-once**: Kafka offsets are stored in each Iceberg snapshot, and the writer resumes from them after a restart, so replays never duplicate rows
+- **Analytics (OLAP)**: run DuckDB queries, including time travel to an earlier snapshot:
+  ```bash
+  docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
+  ```
+
 #### NOTE
 Use the docker compose file `docker-compose.system.yml` as a reference for default ports and credentials.
 
