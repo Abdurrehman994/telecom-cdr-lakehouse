@@ -1,5 +1,7 @@
 # Telecom CDR Streaming Lakehouse
 
+[![CI](https://github.com/Abdurrehman994/telecom-cdr-lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdurrehman994/telecom-cdr-lakehouse/actions/workflows/ci.yml)
+
 > This repository continues a University of Oulu group project
 > ([original repo](https://github.com/FastByte17/DS_Project_2026)) built by
 > Nabeel Hussain, Muhammad Abdur Rehman, Christoph Gasche, Marko Tiitto and Talha Pasha.
@@ -28,6 +30,7 @@ For the design, trade-offs, tested failure scenarios and production roadmap, see
 - [Initial Setup](#initial-setup)
 - [Starting the Stack](#starting-the-stack)
 - [Accessing Services](#accessing-services)
+- [Running Tests](#running-tests)
 - [Security Best Practices](#security-best-practices)
 - [Troubleshooting](#troubleshooting)
 
@@ -195,6 +198,28 @@ Open your web browser and navigate to:
 
 #### NOTE
 Use the docker compose file `docker-compose.system.yml` as a reference for default ports and credentials.
+
+---
+
+## Running Tests
+
+Each service has unit tests with Kafka, Iceberg and Postgres replaced by fakes, so they run without the stack. GitHub Actions runs them on every push, plus the alert store tests against a real Postgres.
+
+The services pin packages for Python 3.11. From `fraud-detection-system/<service>` (`cdr-ingestion`, `lakehouse` or `ml`):
+
+```bash
+pip install -r requirements.txt -r ../requirements-test.txt
+python -m pytest tests
+```
+
+Or without a local Python 3.11, from `fraud-detection-system/`:
+
+```bash
+docker run --rm -v "$PWD:/src" -w /src/lakehouse python:3.11-slim \
+  sh -c "pip install -q -r requirements.txt -r ../requirements-test.txt && python -m pytest tests"
+```
+
+The alert store tests in `ml/tests/test_alert_store_postgres.py` run only with `RUN_POSTGRES_TESTS=1` and `POSTGRES_*` pointing at a disposable database, because they truncate `fraud_alerts`.
 
 ---
 
