@@ -4,6 +4,8 @@ This document describes how call detail records (CDRs) move through the system, 
 
 The project started as a University of Oulu group project that used RabbitMQ for fraud detection. Version 2 replaces the queue with Kafka and adds an Apache Iceberg lakehouse, so the same event stream serves real-time fraud detection and historical analytics.
 
+The streaming and lakehouse parts are built as a small platform that other services build on: every topic has an Avro data contract in a schema registry, a shared client library encodes and decodes messages, and topics land in Iceberg through sinks defined in configuration. Adding a dataset takes a contract, a sink file and a deployment entry, not code ([onboarding guide](onboarding-a-dataset.md)).
+
 ## Contents
 
 - [System overview](#system-overview)
@@ -24,40 +26,49 @@ The project started as a University of Oulu group project that used RabbitMQ for
 ```mermaid
 flowchart LR
     SRC[CDR sources<br/>ingest-auto.py] -->|HTTP POST| ING[cdr-ingestion<br/>FastAPI]
-    ING -->|key = customer_id| T[(Kafka topic<br/>cdr-events<br/>3 partitions)]
+    ING -->|Avro, key = customer_id| T[(Kafka topic<br/>cdr-events<br/>3 partitions)]
+
+    C[contracts/*.avsc] -->|schema-init| SR[Schema Registry]
+    ING & ML1 & ML2 & LW & LD -.->|schema by id| SR
 
     T -->|group: fraud-detection| ML1[ml-service]
     T -->|group: fraud-detection| ML2[ml-service2]
-    T -->|group: lakehouse-writer| LW[lakehouse-writer]
+    T -->|group: lakehouse-writer| LW[sink: cdr_events]
 
     ML1 & ML2 -->|store alert| PG[(Postgres<br/>fraud_alerts)]
     ML1 & ML2 -->|new alerts only| AM[Alertmanager]
     ML1 & ML2 -.->|uncertain cases| OL[Ollama LLM]
+    ML1 & ML2 -->|every decision, Avro| FD[(Kafka topic<br/>fraud-decisions)]
+    FD -->|group: lakehouse-fraud-decisions| LD[sink: fraud_decisions]
     ML1 & ML2 & LW -->|unprocessable| DLQ[(cdr-events-dlq)]
+    LD -->|unprocessable| DLQ2[(fraud-decisions-dlq)]
 
-    LW -->|commit snapshot| CAT[Iceberg REST catalog]
-    LW -->|Parquet files| S3[(SeaweedFS<br/>S3 API)]
+    LW & LD -->|commit snapshot| CAT[Iceberg REST catalog]
+    LW & LD -->|Parquet files| S3[(SeaweedFS<br/>S3 API)]
     CAT -->|metadata files| S3
-    MT[lakehouse-maintenance] -->|compact, expire snapshots| CAT
+    MT[lakehouse-maintenance<br/>every sink's table] -->|compact, expire snapshots| CAT
     MT -->|delete orphan files| S3
 
     Q[query.py<br/>DuckDB] --> CAT
     Q --> S3
 ```
 
-One topic, two independent consumer groups. Fraud detection and the lakehouse each read every CDR at their own pace, and neither can slow down or block the other.
+One topic, two independent consumer groups. Fraud detection and the lakehouse each read every CDR at their own pace, and neither can slow down or block the other. Fraud detection in turn publishes its decisions as events, which a second sink lands in the lakehouse next to the CDRs.
 
 ## Components
 
 | Component | Technology | Role |
 |---|---|---|
-| `cdr-ingestion` | Python, FastAPI, `confluent-kafka` | Validates and enriches CDRs received over HTTP, publishes them to Kafka |
+| `cdr-ingestion` | Python, FastAPI, `confluent-kafka` | Validates and enriches CDRs received over HTTP, publishes them to Kafka as Avro |
 | `kafka` | Apache Kafka 3.9.1, KRaft mode | Durable, ordered, replayable event log |
-| `kafka-init` | One-shot container | Creates `cdr-events` (3 partitions) and `cdr-events-dlq` (1 partition); automatic topic creation is disabled |
-| `ml-service`, `ml-service2` | Python, scikit-learn, Ollama | Fraud detection: rules, then a random forest, then an LLM for uncertain cases. Also serves the alerts API (`/alerts`) |
+| `kafka-init` | One-shot container | Creates `cdr-events` and `fraud-decisions` (3 partitions each) and their dead-letter topics (1 partition each); automatic topic creation is disabled |
+| `schema-registry` | Confluent Schema Registry 7.9.1 | Stores each topic's Avro schema versions (in the `_schemas` topic) and enforces their compatibility rule |
+| `schema-init` | One-shot container | Registers the contracts in [`contracts/`](../fraud-detection-system/contracts/); fails, and stops dependent services from starting, if one breaks its compatibility rule |
+| `libs/dataplatform` | Python library | Shared by every producer and consumer: Avro encoding with registered schemas only, decoding by schema id, the contracts job, and an in-memory registry for tests |
+| `ml-service`, `ml-service2` | Python, scikit-learn, Ollama | Fraud detection: rules, then a random forest, then an LLM for uncertain cases. Publishes every decision to `fraud-decisions`, and serves the alerts API (`/alerts`) |
 | `postgres` | PostgreSQL 15 | OLTP store for fraud alerts and their case status; schema in `postgres/init/` |
-| `lakehouse-writer` | Python, PyIceberg, PyArrow | Streams CDRs into the Iceberg table `telecom.cdr_events` |
-| `lakehouse-maintenance` | Python, PyIceberg | Hourly compaction, snapshot expiry and orphan file cleanup for the Iceberg table |
+| `lakehouse-writer`, `lakehouse-writer-fraud-decisions` | Python, PyIceberg, PyArrow | One process per sink in [`lakehouse/sinks/`](../fraud-detection-system/lakehouse/sinks/): streams a topic into an Iceberg table (`telecom.cdr_events`, `telecom.fraud_decisions`) |
+| `lakehouse-maintenance` | Python, PyIceberg | Hourly compaction, snapshot expiry and orphan file cleanup for every sink's table, with each sink's policy |
 | `iceberg-rest` | Apache Iceberg REST catalog 1.9.1 | Tracks the current metadata file of each table; state kept in SQLite on a volume |
 | `seaweedfs` | SeaweedFS 4.51 | S3-compatible object storage for Parquet data and Iceberg metadata |
 | `query.py` | DuckDB | Analytical (OLAP) queries and snapshot time travel |
@@ -66,11 +77,11 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 
 ## Data flow
 
-1. **Ingest.** A client posts a CDR to `/ingest` or `/ingest/batch`. The service validates it, adds `processed_timestamp` and simple risk flags, and produces it to `cdr-events` with `customer_id` as the key. It answers only after the broker confirms the write.
+1. **Ingest.** A client posts a CDR to `/ingest` or `/ingest/batch`. The service validates it, adds `processed_timestamp` and simple risk flags, encodes it with the `cdr-events` contract, and produces it with `customer_id` as the key. It answers only after the broker confirms the write.
 2. **Partition.** Kafka hashes the key, so all CDRs of one customer land in the same partition, in the order they were produced.
-3. **Detect fraud.** The `fraud-detection` group splits the 3 partitions between the two `ml-service` replicas. Each CDR goes through rules, a random forest score, and the LLM if the score is uncertain. A fraud decision is stored in Postgres; if the row is new, Alertmanager is notified. Analysts list alerts and record decisions (`confirmed`, `dismissed`) through the alerts API.
-4. **Write to the lakehouse.** The `lakehouse-writer` group reads the same partitions independently. It buffers rows and appends a batch to Iceberg every 500 rows or 10 seconds. Each append creates a new snapshot.
-5. **Analyse.** `query.py` loads the current snapshot (or an earlier one) and runs SQL with DuckDB.
+3. **Detect fraud.** The `fraud-detection` group splits the 3 partitions between the two `ml-service` replicas. Each CDR goes through rules, a random forest score, and the LLM if the score is uncertain. A fraud decision is stored in Postgres; if the row is new, Alertmanager is notified. Analysts list alerts and record decisions (`confirmed`, `dismissed`) through the alerts API. Every decision, fraud or not, is published to `fraud-decisions`.
+4. **Write to the lakehouse.** Each sink's writer reads its topic as its own consumer group. It buffers rows and appends a batch to Iceberg every 500 rows or 10 seconds (set in the sink file). Each append creates a new snapshot.
+5. **Analyse.** `query.py` loads the current snapshot (or an earlier one) and runs SQL with DuckDB, including a join of CDRs with the decisions made on them.
 
 ## Design decisions
 
@@ -107,7 +118,7 @@ The ML consumer uses `enable.auto.offset.store=false` and stores a message's off
 
 Kafka offsets and Iceberg data live in different systems, so committing them separately leaves a gap: a crash after the Iceberg commit but before the Kafka commit would write the same rows twice on restart.
 
-The writer closes that gap by storing the offsets **inside the Iceberg commit**, as the snapshot property `kafka.cdr-events.offsets`. Data and position are committed atomically. When partitions are assigned, the writer reads that property and seeks there, ignoring Kafka's own committed offsets. It then commits the same offsets back to Kafka, only so that consumer lag reports correctly.
+The writer closes that gap by storing the offsets **inside the Iceberg commit**, as the snapshot property `kafka.<topic>.offsets` (e.g. `kafka.cdr-events.offsets`). Data and position are committed atomically. When partitions are assigned, the writer reads that property and seeks there, ignoring Kafka's own committed offsets. It then commits the same offsets back to Kafka, only so that consumer lag reports correctly.
 
 This was tested by rewinding the writer's Kafka offsets to 0 and restarting it: it resumed at offsets 248, 328 and 225 from Iceberg and wrote no duplicates.
 
@@ -117,6 +128,42 @@ A later test found a gap anyway. With the broker stopped, the writer appended a 
 - Before each append the writer drops rows whose offset is below what Iceberg already stores for that partition. An append is then idempotent against the table's own state, whatever the bug that re-sends it.
 
 Repeating the same broker outage after the fix: the commit failure was logged, the partitions were revoked and reassigned, the writer did not restart, and no new duplicates were written.
+
+### Data contracts in a schema registry
+
+The first version sent JSON, and producers and consumers agreed on its fields informally. A renamed field or a changed type would only have shown up as messages in a dead-letter topic, after it had already broken the consumers. On a platform that several teams build on, the format of a topic is an interface and needs the same care as an API.
+
+Each topic now has an Avro schema in [`contracts/`](../fraud-detection-system/contracts/), with an owner and a compatibility rule:
+
+- **Registered by a job, never by producers.** `schema-init` runs `python -m dataplatform.contracts apply`, which sets each subject's compatibility level and registers the schema. Producers look their schema up and fail if it is not registered (`auto.register.schemas` off, in effect), so a producer cannot put a new schema on a topic by deploying.
+- **`FULL_TRANSITIVE` compatibility.** Every version must read data written with every other version. Producers and consumers can then upgrade in any order, and a sink can read the whole history of its topic. In practice only fields with defaults can be added or removed. `BACKWARD` would allow adding required fields, but then old consumers break while a new producer rolls out.
+- **Messages carry the schema id.** The Confluent wire format (a zero byte, a 4-byte schema id, then the Avro body) means each message is decoded with the exact schema it was written with, and any tool that speaks the format can read the topics.
+- **A shared client library.** `libs/dataplatform` holds the encoding rules, so services cannot disagree on them. It separates a message that can never be decoded (`InvalidMessage`: dead-letter it) from a temporary problem such as the registry being down (retry, never dead-letter a valid message).
+
+The registry is Confluent Schema Registry, the most widely used implementation of the API. Karapace and Apicurio implement the same API under Apache 2.0 and would be drop-in replacements; the library only uses the client calls they share.
+
+**Migrating from JSON.** Topics already held JSON messages. The decoder still accepts JSON on `cdr-events` (a JSON object starts with `{`, never the zero byte), so the writers and fraud detection read old and new messages side by side, and nothing had to be replayed or converted. Fraud detection turns decoded Avro back into the shape the old JSON had (ISO timestamps, empty fields left out), so the detector itself did not change.
+
+### Config-driven sinks
+
+The first writer had the CDR schema, table name, partitioning and batch size in its code; a second dataset would have meant a second writer. The writer is now generic, and a sink is a YAML file:
+
+- **The table schema comes from the contract.** Each Avro field becomes an Iceberg column (all optional in Iceberg, since the contract decides what is required), plus three lineage columns. The supported types are deliberately limited to what maps cleanly to a column; nested types are rejected with the field named.
+- **Schema evolution follows the contract.** A message carries the id of its schema version. When a sink sees an id for the first time, it adds that version's new fields to the table (`union_by_name`) before buffering the message. Rows written earlier read the new column as null. The registry's compatibility rule has already ruled out changes the table could not follow, such as a type change.
+- **Mistakes fail at startup.** Unknown keys, a partition column the contract lacks, or a transform that does not fit the column type stop the writer with an error that names the problem.
+- **One writer process per sink.** A sink's failures, restarts and scaling stay its own, and the exactly-once logic stays as it was, one topic and one table per process. Kafka Connect runs many sinks in one worker cluster, which uses resources better at a large number of sinks; at this scale, isolation is simpler to reason about.
+- **The table's partitioning is not changed by the config.** If an existing table's partition spec differs from the sink file, the writer logs a warning and keeps the table's spec. Repartitioning is a deliberate migration, not a startup side effect.
+
+The proof is the second dataset. `fraud-decisions` was added with a contract, a sink file and a compose service; the sink's code did not change.
+
+**Tested end to end** on a fresh stack. Two old-style JSON CDRs and one garbage message were put on `cdr-events`, then the 800 sample CDRs were sent through the API as Avro:
+
+- All groups reached lag 0. `telecom.cdr_events` held 802 rows with no duplicate `transaction_id`, and the stored offsets summed to 803 (the garbage message is skipped, not lost). The JSON rows had proper timestamps and doubles.
+- The garbage message reached `cdr-events-dlq` once from each consumer (fraud detection and the sink), with the error and its source offset.
+- `telecom.fraud_decisions` held a decision for every CDR, and the join in `query.py` found no CDR without one.
+- With the stack running, v2 of the `cdr-events` contract (an optional `roaming` field) was registered and one message produced with it. The sink logged the new column, the row had `roaming = true`, and the 802 older rows read it as null. Fraud detection read the v2 message without a dead letter. The registry rejected a further version that dropped the required `amount_eur`.
+- Compaction ran over both tables with their own policies: 451 files became 303 for `cdr_events` and 658 became 303 for `fraud_decisions`, with row counts unchanged.
+- The `cdr_events` table created by the previous, hand-written writer matched the contract-derived schema and partitioning exactly, so the new writer adopts it without a schema change.
 
 ### Batched appends
 
@@ -183,6 +230,8 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Kafka → fraud detection | At least once | Offset stored only after processing |
 | Fraud decision → alert | Effectively once per transaction | `transaction_id` primary key, `ON CONFLICT DO NOTHING`, notify only on insert |
 | Kafka → Iceberg | Exactly once | Offsets committed in the same Iceberg snapshot as the data |
+| Fraud detection → `fraud-decisions` | At least once | Each decision is confirmed by the broker before the CDR's offset is stored; a replay publishes it again, so consumers deduplicate on `transaction_id` |
+| Producer → topic format | Only registered contract versions | Producers encode with a schema that must already be registered; the registry rejects incompatible versions |
 | HTTP client → Kafka | At least once, if the client retries | The API waits for the broker's delivery report: `202` only after the CDR is stored, `503` (or a per-record error in a batch) if it is not |
 
 ## Failure scenarios
@@ -197,6 +246,10 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
 | A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
 | The Kafka broker stops | Ingestion answers `503` after about 10 seconds, so clients know to retry; consumers wait and rejoin their groups when it returns. Tested: no messages lost, no duplicate rows, no writer restart. With one broker this is an outage; replication would prevent it. |
+| A contract change breaks compatibility | The registry rejects it and `schema-init` exits non-zero, so the producers and consumers that depend on it do not start with the new version. Tested against the real registry, in CI and on the stack. |
+| A new contract version arrives | The sink adds its new fields as columns before writing the message; consumers decode it with its own schema. Tested live; see [Config-driven sinks](#config-driven-sinks). |
+| A message is not Avro from the registry (or JSON, on `cdr-events`) | `InvalidMessage`: dead-lettered with the error, processing continues. Tested. |
+| The schema registry is unavailable | Not yet tested on the stack. By design: producers and consumers cache schemas by id, so only new schema ids need the registry. Ingestion answers `503` for CDRs it cannot encode; fraud detection retries the decode with backoff instead of dead-lettering; the sink stops and restarts from the offsets in Iceberg. Unit tested for fraud detection. |
 
 ## Performance
 
@@ -218,6 +271,8 @@ Measured with [`loadtest/loadtest.py`](../fraud-detection-system/loadtest/loadte
 
 Fixed with [table maintenance](#table-maintenance), plus a setting for the commit size (`LAKEHOUSE_FLUSH_MAX_RECORDS`, `LAKEHOUSE_FLUSH_INTERVAL_SECONDS`). After a 10,000-CDR run, compaction rewrote 251 partitions in about 100 seconds: 5,081 files became 301 (one per day), and the table shrank from 36.5 MB to 2.4 MB, because each tiny Parquet file carries its own footer and metadata. Rows and offsets were unchanged.
 
+**Alertmanager on the hot path.** During the end-to-end test of the sinks, Alertmanager was not running, and fraud detection slowed to under 1 CDR/s: every alert waited on a failing call to it, the same pattern as the LLM before its circuit breaker. With Alertmanager started, the rate went from 15 to 217 CDRs per 20 seconds. Notifications belong off the processing path too.
+
 **Where the next limits are.** The fraud consumer does a synchronous Postgres insert and an HTTP call per alert; batching inserts and sending alerts asynchronously would raise it. With 3 partitions, at most 3 replicas can share the work. With the LLM enabled, its latency (seconds per call on CPU) bounds the uncertain cases; it belongs off the hot path, for example as a separate review topic.
 
 ## Monitoring
@@ -229,8 +284,10 @@ Every service exports Prometheus metrics, and Grafana loads the **CDR Pipeline**
 | `kafka-exporter` | Consumer lag per group and partition; topic offsets, which give the produce rate and the DLQ rate |
 | `cdr-ingestion` (`/metrics`) | CDRs by result (`accepted`, `invalid`, `publish_failed`); wait for Kafka confirmation |
 | `ml-service` (`/metrics`) | CDRs processed by outcome; fraud by detection method; LLM calls skipped by the circuit breaker; duplicate alerts skipped |
-| `lakehouse-writer` (`:8002`) | Rows appended and skipped; Iceberg commit duration; commit conflicts; failed Kafka offset commits; buffered rows; time of last commit |
-| `lakehouse-maintenance` (`:8003`) | Data files, rows, bytes and snapshots in the table; files compacted; snapshots expired; orphan files deleted; last success and failures per task |
+| Each sink's writer (`:8002`) | Rows appended and skipped; Iceberg commit duration; commit conflicts; failed Kafka offset commits; dead-lettered messages; columns added by contract changes; buffered rows; time of last commit |
+| `lakehouse-maintenance` (`:8003`) | Data files, rows, bytes and snapshots per table; files compacted; snapshots expired; orphan files deleted; last success and failures per task and table |
+
+Lakehouse metrics carry a `table` label, and the dashboard has a table picker for the lakehouse panels. The writer's last-commit metric also carries `consumergroup` and `topic`, matching kafka-exporter's labels, so `LakehouseWriterNotCommitting` joins each sink with its own consumer lag and works for any new sink without a rule change.
 
 Alert rules ([`alerts.yml`](../fraud-detection-system/monitoring/prometheus/alerts.yml)) go to Alertmanager:
 
@@ -240,7 +297,7 @@ Alert rules ([`alerts.yml`](../fraud-detection-system/monitoring/prometheus/aler
 | `ConsumerGroupStalled` | A group is behind and has not moved for 10 minutes |
 | `DeadLetterMessages` | Anything reached `cdr-events-dlq` in the last 15 minutes |
 | `IngestPublishFailures` | Ingestion cannot publish to Kafka (clients get 503s) |
-| `LakehouseWriterNotCommitting` | The writer has CDRs to write but no commit for 5 minutes |
+| `LakehouseWriterNotCommitting` | A sink has messages to write but no commit for 5 minutes |
 | `LakehouseCommitConflicts` | More than 10 append retries in 15 minutes |
 | `LLMUnavailable` | The circuit breaker has been skipping the LLM for 10 minutes |
 | `LakehouseSmallFiles` | Over 1,000 files averaging under 1 MB for 30 minutes |
@@ -250,6 +307,8 @@ Alert rules ([`alerts.yml`](../fraud-detection-system/monitoring/prometheus/aler
 Two things the dashboard caught while it was being built: a maintenance restart showed the table at 0 files until the first run finished (the gauges now read the table at startup), and the maintenance job crash-looped on a fresh stack because the table did not exist yet (it now waits for the writer to create it).
 
 ## Data model
+
+Each table has one column per field of its topic's contract ([`cdr-events-value.avsc`](../fraud-detection-system/contracts/cdr-events-value.avsc), [`fraud-decisions-value.avsc`](../fraud-detection-system/contracts/fraud-decisions-value.avsc)), then the lineage columns `kafka_partition`, `kafka_offset` and `ingested_at`.
 
 Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 
@@ -269,16 +328,33 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 | `kafka_partition`, `kafka_offset` | int, long | Lineage: where each row came from |
 | `ingested_at` | timestamptz | When the writer read it |
 
+Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like the CDRs, so a join on one day reads one partition of each:
+
+| Column | Type | Notes |
+|---|---|---|
+| `transaction_id`, `customer_id` | string | The CDR the decision is about |
+| `is_fraud` | boolean | |
+| `method` | string | `rules`, `random_forest`, `llm`, `llm_error` or `scoring_fallback` |
+| `fraud_type`, `confidence`, `explanation` | string, double, string | Null where the method gives none |
+| `amount_eur` | double | |
+| `event_time` | timestamptz | The CDR's `time_stamp` |
+| `decided_at` | timestamptz | |
+| `detector` | string | The `ml-service` replica |
+| `source_partition`, `source_offset` | int, long | Where the CDR was in `cdr-events` |
+| `kafka_partition`, `kafka_offset`, `ingested_at` | int, long, timestamptz | Lineage in `fraud-decisions` |
+
 ## Known limitations
 
 - **A client retry can duplicate a CDR in Kafka.** The API now waits for the broker before answering, so a CDR is no longer lost silently. But if the broker stores a CDR after the API has given up waiting (10 seconds), the client sees an error, retries, and the CDR is produced twice. Fraud alerts are deduplicated by `transaction_id`; the Iceberg table is not, so analytical queries should count distinct `transaction_id`, or a deduplicated table should be built from it.
 - **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
 - **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
-- **One lakehouse writer.** The offset merge assumes a single writer. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
+- **One writer per sink.** The offset merge assumes a single writer per table. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
+- **Stored offsets do not identify the topic.** If a topic is deleted and recreated, its offsets start again at 0, but the sink still resumes from the offsets stored in Iceberg and skips the new messages until it passes them. Storing the topic's id (Kafka topic ids, KIP-516) with the offsets would let the sink detect a new topic and start from its beginning.
+- **Flat contracts only.** Sinks reject nested records, arrays and maps. Iceberg supports them; mapping them is future work.
 - **Compaction competes with the writer.** PyIceberg rejects a commit whenever anything else committed since it read the table, even an append to an unrelated partition. Under constant writes, compaction can retry several times (it lost three races in a row in testing) and could give up after five. Iceberg's Java implementation validates conflicts per file instead, so non-overlapping appends do not block a rewrite; Spark's `rewrite_data_files` would avoid this.
 - **Compaction holds a range in memory.** Each commit reads up to 50 day partitions into memory before rewriting them. Fine at this scale; larger tables need smaller ranges or a distributed engine.
 - **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication.
-- **No schema contract.** Producers and consumers agree on JSON fields informally; a breaking change would only show up as DLQ messages.
+- **One registry, no authentication.** Anyone who can reach the registry can register a schema or change a compatibility level. The contracts job is the intended path, but nothing enforces it.
 - **DuckDB loads the snapshot into memory.** Fine for this data volume, not for large tables.
 
 ## Path to production
@@ -286,11 +362,11 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 | Area | Local setup | Production |
 |---|---|---|
 | Kafka | 1 broker, replication factor 1 | 3+ brokers, replication factor 3, `min.insync.replicas=2`, rack awareness |
-| Schemas | Informal JSON | Avro or Protobuf with a schema registry and compatibility rules |
+| Schemas | Avro contracts, one registry, registered by a job at startup | A replicated registry with authentication, where only CI can register; contract changes checked against the production registry before merge |
 | Catalog | `iceberg-rest-fixture`, SQLite | Apache Polaris, Lakekeeper or Nessie, backed by Postgres, with access control |
 | Storage | SeaweedFS, one container | S3 or equivalent, with lifecycle rules |
 | Query engine | DuckDB, in memory | Trino or Spark for large scans; DuckDB for local analysis |
-| Lakehouse writes | Python writer | Kafka Connect Iceberg sink or Flink, for higher throughput |
+| Lakehouse writes | Python writer per sink, configured by YAML | The same sink files driving the Kafka Connect Iceberg sink or Flink, for higher throughput |
 | Table maintenance | Python job: compaction, snapshot expiry, orphan cleanup, every hour | The same jobs in Spark (`rewrite_data_files`, `expire_snapshots`, `remove_orphan_files`) or the catalog's managed maintenance, scheduled by an orchestrator |
 | OLTP | One Postgres container, schema from an init script | Managed Postgres with replicas and backups; schema migrations with a tool such as Alembic or Flyway |
 | Monitoring | Prometheus, Grafana dashboard, alert rules, one Alertmanager with no receivers | Alerts routed to on-call (e.g. PagerDuty, Slack); long-term metric storage; dashboards and rules kept in version control, as here |
@@ -303,7 +379,11 @@ From `fraud-detection-system/`:
 
 ```bash
 # Start the pipeline, table maintenance and monitoring
-docker compose -f docker-compose.system.yml up -d --build cdr-ingestion ml-service ml-service2 lakehouse-writer     lakehouse-maintenance kafka-exporter prometheus grafana
+docker compose -f docker-compose.system.yml up -d --build cdr-ingestion ml-service ml-service2 lakehouse-writer \
+    lakehouse-writer-fraud-decisions lakehouse-maintenance kafka-exporter prometheus grafana
+
+# Registered contracts
+curl -s http://localhost:8081/subjects
 
 # Send the sample dataset (800 CDRs)
 python ingest-auto/ingest-auto.py --batch-size 50
@@ -311,7 +391,7 @@ python ingest-auto/ingest-auto.py --batch-size 50
 # Consumer lag for both groups (LAG should reach 0)
 docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
 
-# Query the lakehouse: row counts, duplicates, fraud by type, time travel
+# Query the lakehouse: row counts, duplicates, fraud by type, decisions joined with CDRs, time travel
 docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
 
 # Table health: snapshots, data files, rows, bytes

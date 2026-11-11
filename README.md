@@ -7,16 +7,21 @@
 > Nabeel Hussain, Muhammad Abdur Rehman, Christoph Gasche, Marko Tiitto and Talha Pasha.
 > Work from November 2026 onward is by Muhammad Abdur Rehman.
 
-Call detail records (CDRs) stream through Kafka into two independent consumers: real-time fraud detection and an Apache Iceberg lakehouse.
+Call detail records (CDRs) stream through Kafka into two independent consumers: real-time fraud detection and an Apache Iceberg lakehouse. Every topic has an Avro data contract in a schema registry, and topics land in Iceberg through config-driven sinks: adding a dataset takes a contract and a sink file, not code.
 
 ```text
+                     Schema Registry (Avro contracts, FULL_TRANSITIVE)
 HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
                             ├─► ml-service ×2 ─► Postgres (fraud_alerts) ─► Alertmanager
-                            └─► lakehouse-writer ─► Iceberg on S3 (SeaweedFS) ─► DuckDB
+                            │        └─► Kafka (fraud-decisions)
+                            │                └─► sink: fraud_decisions ─┐
+                            └─► sink: cdr_events ───────────────────────┴─► Iceberg on S3 (SeaweedFS) ─► DuckDB
 ```
 
 ## Highlights
 
+- **Data contracts.** Each topic's messages have an Avro schema in a schema registry, with `FULL_TRANSITIVE` compatibility. A breaking change is rejected when contracts are registered, and producers can only send with a registered schema. A shared client library (`libs/dataplatform`) does the encoding for every service.
+- **Config-driven lakehouse sinks.** A YAML file per sink names the topic, table, partitioning, batching and maintenance policy; the table's columns come from the contract. New optional contract fields become new columns automatically. A second dataset, fraud decisions, was onboarded with three files and no new code ([how](docs/onboarding-a-dataset.md)).
 - **Exactly-once into Iceberg.** Kafka offsets are stored in the same Iceberg snapshot as the data, so a crash or an offset reset never duplicates or loses rows.
 - **Idempotent fraud alerts.** Alerts are keyed by `transaction_id`, so replaying the topic creates no duplicate alerts or notifications.
 - **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
@@ -26,7 +31,7 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
 - **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 11 alert rules, and a provisioned Grafana dashboard.
 - **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the test found and fixed two bottlenecks in fraud detection.
 
-For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md).
+For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md). To add a dataset, see [docs/onboarding-a-dataset.md](docs/onboarding-a-dataset.md).
 
 ## Table of Contents
 - [Prerequisites](#prerequisites)
@@ -171,9 +176,18 @@ Open your web browser and navigate to:
 - **URL**: http://localhost:8080/docs
 - Run payloads to service
 
+### Schema Registry
+- **URL**: http://localhost:8081 (e.g. http://localhost:8081/subjects)
+- **Contracts**: `fraud-detection-system/contracts/`, registered by the one-shot `schema-init` job on startup
+- **Check a contract change** before starting the stack:
+  ```bash
+  pip install fraud-detection-system/libs/dataplatform
+  python -m dataplatform.contracts check fraud-detection-system/contracts --registry-url http://localhost:8081
+  ```
+
 ### Kafka
 - **Broker from the host**: `localhost:9094` (containers use `kafka:9092`)
-- **Topics**: `cdr-events` (3 partitions, keyed by `customer_id`), `cdr-events-dlq` (messages that failed processing)
+- **Topics**: `cdr-events` (3 partitions, keyed by `customer_id`), `fraud-decisions` (3 partitions, one decision per CDR), and a dead-letter topic for each (`cdr-events-dlq`, `fraud-decisions-dlq`)
 - **Consumer group**: `fraud-detection` (`ml-service` and `ml-service2` share the partitions)
 - **Check consumer lag**:
   ```bash
@@ -190,7 +204,8 @@ Open your web browser and navigate to:
 - Each transaction has at most one alert, so replaying Kafka never duplicates alerts or notifications
 
 ### Lakehouse (Apache Iceberg)
-- **Flow**: `lakehouse-writer` reads `cdr-events` as its own consumer group (`lakehouse-writer`) and appends CDRs in batches to the Iceberg table `telecom.cdr_events`, partitioned by day
+- **Sinks**: one writer per file in `fraud-detection-system/lakehouse/sinks/`. `lakehouse-writer` streams `cdr-events` into `telecom.cdr_events`, and `lakehouse-writer-fraud-decisions` streams `fraud-decisions` into `telecom.fraud_decisions`; both are partitioned by day. Each sink reads its topic as its own consumer group
+- **Columns**: one per field of the topic's contract, plus `kafka_partition`, `kafka_offset` and `ingested_at`
 - **Storage**: SeaweedFS (S3 API at http://localhost:8333), bucket `warehouse`, Parquet data files
 - **Catalog**: Iceberg REST catalog at http://localhost:8181
 - **Exactly-once**: Kafka offsets are stored in each Iceberg snapshot, and the writer resumes from them after a restart, so replays never duplicate rows
@@ -198,7 +213,7 @@ Open your web browser and navigate to:
   ```bash
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
   ```
-- **Maintenance**: `lakehouse-maintenance` compacts small files, expires old snapshots and deletes unreferenced files every hour. To check the table or run a job now:
+- **Maintenance**: `lakehouse-maintenance` compacts small files, expires old snapshots and deletes unreferenced files every hour, for every sink's table, with the policy in its sink file. To check the tables or run a job now (`--sink cdr_events` limits it to one):
   ```bash
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py stats
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py compact
@@ -213,10 +228,10 @@ Use the docker compose file `docker-compose.system.yml` as a reference for defau
 
 Each service has unit tests with Kafka, Iceberg and Postgres replaced by fakes, so they run without the stack. GitHub Actions runs them on every push, plus the alert store tests against a real Postgres.
 
-The services pin packages for Python 3.11. From `fraud-detection-system/<service>` (`cdr-ingestion`, `lakehouse` or `ml`):
+The services pin packages for Python 3.11 and use the platform library in `libs/dataplatform`. From `fraud-detection-system/<service>` (`cdr-ingestion`, `lakehouse` or `ml`):
 
 ```bash
-pip install -r requirements.txt -r ../requirements-test.txt
+pip install -r requirements.txt -r ../requirements-test.txt ../libs/dataplatform
 python -m pytest tests
 ```
 
@@ -224,8 +239,10 @@ Or without a local Python 3.11, from `fraud-detection-system/`:
 
 ```bash
 docker run --rm -v "$PWD:/src" -w /src/lakehouse python:3.11-slim \
-  sh -c "pip install -q -r requirements.txt -r ../requirements-test.txt && python -m pytest tests"
+  sh -c "pip install -q -r requirements.txt -r ../requirements-test.txt ../libs/dataplatform && python -m pytest tests"
 ```
+
+The lakehouse tests include sinks running against a real Iceberg table (SQLite catalog, local files). The library's own tests are in `libs/dataplatform/tests` (`pip install ./libs/dataplatform -r requirements-test.txt`); the ones against a real schema registry run only with `TEST_SCHEMA_REGISTRY_URL` set, e.g. `http://localhost:8081` with the stack up.
 
 The alert store tests in `ml/tests/test_alert_store_postgres.py` run only with `RUN_POSTGRES_TESTS=1` and `POSTGRES_*` pointing at a disposable database, because they truncate `fraud_alerts`.
 
