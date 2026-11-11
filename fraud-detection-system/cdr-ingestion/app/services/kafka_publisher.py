@@ -13,6 +13,8 @@ logger = logging.getLogger(__name__)
 
 # How long the producer keeps retrying a message before reporting it as failed
 DELIVERY_TIMEOUT_MS = 10000
+# Extra wait after that for the delivery callback to be scheduled
+DELIVERY_WAIT_GRACE_SECONDS = 5
 
 
 class DateTimeEncoder(json.JSONEncoder):
@@ -96,8 +98,8 @@ class KafkaPublisher:
             except (KafkaException, BufferError) as e:
                 outcome["error"] = str(e)
 
-        # The producer gives up after delivery.timeout.ms; the extra seconds cover callback scheduling
-        deadline = time.monotonic() + DELIVERY_TIMEOUT_MS / 1000 + 5
+        # The producer gives up after delivery.timeout.ms, so this only guards against a lost callback
+        deadline = time.monotonic() + DELIVERY_TIMEOUT_MS / 1000 + DELIVERY_WAIT_GRACE_SECONDS
         for done in pending:
             while not done.is_set() and time.monotonic() < deadline:
                 self.producer.poll(0.1)
