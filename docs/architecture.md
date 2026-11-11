@@ -106,9 +106,17 @@ Fraud patterns are per customer: a SIM swap followed by large payments, or many 
 
 Trade-off: **key skew**. Customers with more activity make some partitions bigger. In the test data, partitions hold 248, 328 and 224 messages. With real traffic, a few very active subscribers could overload one partition; the usual answers are more partitions or a composite key.
 
-### KRaft, and why there is one broker
+### Three Kafka nodes, replicated writes
 
-KRaft lets Kafka manage its own cluster metadata, without a separate ZooKeeper cluster. One broker with replication factor 1 keeps the local stack light. It is not fault tolerant; see [Path to production](#path-to-production).
+Kafka runs as three nodes, each both a broker and a KRaft controller (KRaft lets Kafka manage its own metadata, without ZooKeeper). Every topic has replication factor 3 and `min.insync.replicas=2`, and producers use `acks=all`: a write is confirmed only once two brokers have it. So:
+
+- **Losing one node changes nothing for clients.** Each partition still has two in-sync replicas, so writes keep being confirmed after a new leader is elected, and two of three controllers keep the metadata quorum.
+- **Losing two nodes stops writes rather than risking them.** One replica cannot satisfy `min.insync.replicas=2`, so the producer gets errors and the API answers `503`; no CDR is confirmed while it exists on a single broker. With the controllers co-located, the quorum is lost too, so no leader can be elected until a node returns.
+- **No unclean leader election.** A replica that missed writes is never made leader, even if that keeps a partition offline: availability is given up before data.
+
+Every client gets all three brokers in its bootstrap list, so it can connect while any one of them is down.
+
+**The data had not been on the volume.** While setting this up, it turned out the single broker had written to `/tmp/kafka-logs` inside its container: the `apache/kafka` image defaults to that, and the compose file mounted a volume at `/var/lib/kafka/data` without pointing `log.dirs` at it. Every time Compose recreated the container, all topics, consumer offsets and the cluster itself were silently replaced by empty ones, which is how `cdr-events` came to be "recreated" in [Offsets name their topic](#exactly-once-into-iceberg). `KAFKA_LOG_DIRS` now points at the volume. The topic-id check meant the sinks lost nothing when it happened, and the switch to three nodes, a new cluster, exercised it again: both sinks saw new topic ids and read the new topics from the beginning.
 
 ### Explicit topic creation
 
@@ -274,11 +282,38 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Ollama unavailable | Uncertain cases fall back to the random forest score. After one failure the LLM is skipped for 30 seconds (circuit breaker), so the partition is not held up waiting for the same failure on every CDR. Tested under load; see [Performance](#performance). |
 | Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
 | A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
-| The Kafka broker stops | Ingestion answers `503` after about 10 seconds, so clients know to retry; consumers wait and rejoin their groups when it returns. Tested: no messages lost, no duplicate rows, no writer restart. With one broker this is an outage; replication would prevent it. |
+| One Kafka broker is killed | Its partitions get new leaders within seconds and writes go on with two in-sync replicas. Tested with [`broker_failure.py`](../fraud-detection-system/loadtest/broker_failure.py), see below. |
+| Two Kafka brokers are killed | Writes stop: the API answers `503` instead of confirming CDRs held by one broker; consumers wait. Tested, see below. |
 | A contract change breaks compatibility | The registry rejects it and `schema-init` exits non-zero, so the producers and consumers that depend on it do not start with the new version. Tested against the real registry, in CI and on the stack. |
 | A new contract version arrives | The sink adds its new fields as columns before writing the message; consumers decode it with its own schema. Tested live; see [Config-driven sinks](#config-driven-sinks). |
 | A message is not Avro from the registry (or JSON, on `cdr-events`) | `InvalidMessage`: dead-lettered with the error, processing continues. Tested. |
 | The schema registry is unavailable | Not yet tested on the stack. By design: producers and consumers cache schemas by id, so only new schema ids need the registry. Ingestion answers `503` for CDRs it cannot encode; fraud detection retries the decode with backoff instead of dead-lettering; the sink stops and restarts from the offsets in Iceberg. Unit tested for fraud detection. |
+
+### Broker failure tests
+
+[`loadtest/broker_failure.py`](../fraud-detection-system/loadtest/broker_failure.py) sends CDRs at 25 per second for 90 seconds, SIGKILLs brokers mid-stream, restarts them 35 seconds later, and then checks the promise end to end through Trino: every CDR the API accepted is in `cdr_events`, no Kafka message is in a table twice, and every CDR has a decision. The sender behaves like a client that follows the API's contract and sends a rejected CDR again.
+
+**One broker** (the leader of partition 0) killed at 21 s:
+
+| | |
+|---|---|
+| Failover | Within 8 s the other brokers led all partitions, each with 2 in-sync replicas |
+| Writes while the broker was down | 896 CDRs accepted; 1 batch rejected (its 10 s delivery timeout ran out during the leader election) and accepted on retry |
+| Recovery | The restarted broker caught up and every partition was fully replicated about 40 s later |
+| Result | 2,250 accepted, 2,250 in `cdr_events`, 0 lost, 0 rows at a duplicate Kafka position, 0 CDRs without a decision |
+
+**Two brokers** (1 and 2) killed at 25 s:
+
+| | |
+|---|---|
+| While they were down | 0 CDRs accepted: requests waited out the 10 s delivery timeout and got `503`. With two of three controllers gone there was no quorum, so the partition metadata froze (it still listed the dead brokers as in sync) until they returned |
+| Recovery | Writes resumed right after the restart; every partition fully replicated again about 47 s later |
+| Result | 2,250 accepted (after the client's retries), 2,250 in `cdr_events`, 0 lost, 0 rows at a duplicate Kafka position, 0 CDRs without a decision |
+| Duplicates | 16 CDRs are in Kafka twice. The surviving leader had appended them but could not confirm them, so the API answered `503` and the client sent them again; when the followers returned, the first copies were committed too. The sinks wrote each Kafka message once; the duplicates are separate messages with the same `transaction_id` |
+
+The duplicates are the known limitation below ("A client retry can duplicate a CDR in Kafka"), now measured: none with one broker down, 16 of 2,250 with two. Fraud alerts are already deduplicated by `transaction_id`; for the lakehouse, a deduplicated view or a sink-side merge on `transaction_id` would remove them.
+
+Every other service rode out the outage without a restart. In a first run of this test, the test script itself crashed during the two-broker outage (its own Kafka command hung without a quorum), leaving the cluster down to one node for about 20 minutes; when the brokers were started again, all services, which had been waiting, carried on.
 
 ## Performance
 
@@ -376,7 +411,7 @@ Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like t
 
 ## Known limitations
 
-- **A client retry can duplicate a CDR in Kafka.** The API now waits for the broker before answering, so a CDR is no longer lost silently. But if the broker stores a CDR after the API has given up waiting (10 seconds), the client sees an error, retries, and the CDR is produced twice. Fraud alerts are deduplicated by `transaction_id`; the Iceberg table is not, so analytical queries should count distinct `transaction_id`, or a deduplicated table should be built from it.
+- **A client retry can duplicate a CDR in Kafka.** The API now waits for the broker before answering, so a CDR is no longer lost silently. But if the broker stores a CDR after the API has given up waiting (10 seconds), the client sees an error, retries, and the CDR is produced twice. Measured with two of three brokers down: 16 of 2,250 CDRs ([broker failure tests](#broker-failure-tests)). Fraud alerts are deduplicated by `transaction_id`; the Iceberg table is not, so analytical queries should count distinct `transaction_id`, or a deduplicated table should be built from it.
 - **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
 - **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
 - **One writer per sink.** The offset merge assumes a single writer per table. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
@@ -393,7 +428,7 @@ Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like t
 
 | Area | Local setup | Production |
 |---|---|---|
-| Kafka | 1 broker, replication factor 1 | 3+ brokers, replication factor 3, `min.insync.replicas=2`, rack awareness |
+| Kafka | 3 nodes, each broker and controller; replication factor 3, `min.insync.replicas=2` | Dedicated controller nodes, brokers spread over availability zones with rack-aware replica placement, operated by Strimzi on Kubernetes |
 | Schemas | Avro contracts, one registry, registered by a job at startup | A replicated registry with authentication, where only CI can register; contract changes checked against the production registry before merge |
 | Catalog | Lakekeeper on Postgres, authentication off, vended credentials from SeaweedFS STS | Lakekeeper with OpenID Connect and OpenFGA, a replicated Postgres with backups, credentials from the cloud's STS scoped to each table |
 | Storage | SeaweedFS, one container | S3 or equivalent, with lifecycle rules |

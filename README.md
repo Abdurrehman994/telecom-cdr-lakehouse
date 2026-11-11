@@ -33,6 +33,7 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
 - **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup, safe to run while the writer commits. After a load test it turned 5,081 small files into 301.
 - **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard.
 - **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the test found and fixed two bottlenecks in fraud detection.
+- **Replicated Kafka, tested by killing brokers.** Three nodes, replication factor 3, `min.insync.replicas=2`. With a broker killed mid-stream, writes went on and no accepted CDR was lost or duplicated; with two killed, the API refused writes rather than confirm unreplicated data.
 
 For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md). To add a dataset, see [docs/onboarding-a-dataset.md](docs/onboarding-a-dataset.md).
 
@@ -189,7 +190,8 @@ Open your web browser and navigate to:
   ```
 
 ### Kafka
-- **Broker from the host**: `localhost:9094` (containers use `kafka:9092`)
+- **Brokers**: three nodes (`kafka`, `kafka-2`, `kafka-3`), replication factor 3, `min.insync.replicas=2`. From the host: `localhost:9094`, `9095`, `9096`; containers use `kafka:9092,kafka-2:9092,kafka-3:9092`
+- **Failure test**: `python loadtest/broker_failure.py --scenario one` (or `two`) kills brokers while sending CDRs and checks that nothing accepted was lost
 - **Topics**: `cdr-events` (3 partitions, keyed by `customer_id`), `fraud-decisions` (3 partitions, one decision per CDR), and a dead-letter topic for each (`cdr-events-dlq`, `fraud-decisions-dlq`)
 - **Consumer group**: `fraud-detection` (`ml-service` and `ml-service2` share the partitions)
 - **Check consumer lag**:
