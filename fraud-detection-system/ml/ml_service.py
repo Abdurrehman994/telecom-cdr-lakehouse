@@ -37,10 +37,16 @@ class FraudDetectionEngine:
         self.sim_status_encoder.fit(['active', 'suspended', 'blocked', 'compromised', 'unknown'])
         self.rf_trained = False
 
-        # batch training buffer. trains once 50 CDRs have been collected
+        # batch training buffer. retrains on the latest 1000 CDRs every 50 new ones
         self.BATCH_SIZE = 50
         self.training_buffer: deque = deque(maxlen=1000)
+        self.samples_since_training = 0
         self.training_lock = threading.Lock()
+
+        # circuit breaker: after an LLM failure, skip the LLM for a while instead of
+        # making every uncertain CDR wait for the same failure and blocking the partition
+        self.LLM_RETRY_AFTER_SECONDS = 30
+        self.llm_unavailable_until = 0.0
 
         print(" random forest model initialized,  will train after first batch of CDRs")
         
@@ -175,8 +181,12 @@ class FraudDetectionEngine:
         label = 1 if cdr.get('fraud_flag', False) or cdr.get('risk_score', 0) > 0.5 else 0
         with self.training_lock:
             self.training_buffer.append((cdr, label))
-            if len(self.training_buffer) >= self.BATCH_SIZE:
+            self.samples_since_training += 1
+            # the buffer is a sliding window that never empties, so count new CDRs;
+            # checking its length would retrain on every CDR once it holds 50
+            if self.samples_since_training >= self.BATCH_SIZE:
                 self._train_batch()
+                self.samples_since_training = 0
 
     def _train_batch(self):
         """train (or re-train) the random forest on the current buffer.
@@ -197,9 +207,11 @@ class FraudDetectionEngine:
     @llm_latency.time()
     def llm_validate(self, cdr: Dict, ml_score: float) -> Dict:
         """use LLM for uncertain cases"""
-        
+        if time.monotonic() < self.llm_unavailable_until:
+            return self._score_fallback(ml_score)
+
         prompt = self.create_llm_prompt(cdr, ml_score)
-        
+
         try:
             response = requests.post(
                 f"{self.ollama_host}/api/generate",
@@ -212,7 +224,8 @@ class FraudDetectionEngine:
                         "top_p": 0.9
                     }
                 },
-                timeout=30
+                # fail fast if Ollama is unreachable, but give generation time to finish
+                timeout=(2, 30)
             )
             
             llm_response = response.json()['response']
@@ -226,14 +239,18 @@ class FraudDetectionEngine:
             return parsed_result
             
         except Exception as e:
-            print(f"LLM validation error: {e}")
-            # fallback to scoring if LLM fails
-            return {
-                'is_fraud': ml_score > 0.5,
-                'confidence': ml_score,
-                'method': 'scoring_fallback',
-                'explanation': f'LLM unavailable, using score: {ml_score:.2f}'
-            }
+            print(f"LLM validation error: {e}; skipping the LLM for {self.LLM_RETRY_AFTER_SECONDS}s")
+            self.llm_unavailable_until = time.monotonic() + self.LLM_RETRY_AFTER_SECONDS
+            return self._score_fallback(ml_score)
+
+    def _score_fallback(self, ml_score: float) -> Dict:
+        """decide on the model score alone when the LLM cannot be used"""
+        return {
+            'is_fraud': ml_score > 0.5,
+            'confidence': ml_score,
+            'method': 'scoring_fallback',
+            'explanation': f'LLM unavailable, using score: {ml_score:.2f}'
+        }
     
     def create_llm_prompt(self, cdr: Dict, ml_score: float) -> str:
         """Create structured prompt for LLM"""
