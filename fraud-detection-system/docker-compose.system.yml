@@ -1,10 +1,19 @@
-# shared by the lakehouse writers and the maintenance job
+# shared by the lakehouse writers, the maintenance job and the catalog setup
 x-lakehouse-env: &lakehouse-env
-  ICEBERG_CATALOG_URI: http://iceberg-rest:8181
+  ICEBERG_CATALOG_URI: http://lakekeeper:8181/catalog
+  ICEBERG_WAREHOUSE: lakehouse
   S3_ENDPOINT: http://seaweedfs:8333
   S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
   S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
   S3_BUCKET: warehouse
+
+# the Lakekeeper catalog server and its migration job
+x-lakekeeper-env: &lakekeeper-env
+  LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-lakekeeper-dev-password}@lakekeeper-db:5432/lakekeeper
+  LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:${LAKEKEEPER_DB_PASSWORD:-lakekeeper-dev-password}@lakekeeper-db:5432/lakekeeper
+  # encrypts the storage keys Lakekeeper keeps in its database
+  LAKEKEEPER__PG_ENCRYPTION_KEY: ${LAKEKEEPER_ENCRYPTION_KEY:-dev-only-lakekeeper-encryption-key}
+  RUST_LOG: info
 
 # the platform client library and the data contracts, for images that need them
 x-platform-contexts: &platform-contexts
@@ -339,6 +348,9 @@ services:
     environment:
       S3_ACCESS_KEY: ${S3_ACCESS_KEY:-lakehouse}
       S3_SECRET_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
+      S3_BUCKET: warehouse
+      # signs the short-lived credentials STS hands out (base64, at least 32 bytes)
+      S3_STS_SIGNING_KEY: ${S3_STS_SIGNING_KEY:-ZGV2LW9ubHktc3RzLXNpZ25pbmcta2V5LWZvci1zZWF3ZWVkZnM=}
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
@@ -346,9 +358,18 @@ services:
         cat > /tmp/s3.json <<EOF
         {"identities": [{"name": "lakehouse",
           "credentials": [{"accessKey": "$$S3_ACCESS_KEY", "secretKey": "$$S3_SECRET_KEY"}],
-          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}]}
+          "actions": ["Admin", "Read", "Write", "List", "Tagging"]}],
+         "sts": {"tokenDuration": "1h", "maxSessionLength": "12h", "issuer": "seaweedfs-sts",
+                 "signingKey": "$$S3_STS_SIGNING_KEY"},
+         "roles": [{"roleName": "LakehouseVendedRole",
+                    "roleArn": "arn:aws:iam::000000000000:role/LakehouseVendedRole",
+                    "trustPolicy": {"Version": "2012-10-17", "Statement": [
+                      {"Effect": "Allow", "Principal": "*", "Action": "sts:AssumeRole"}]},
+                    "attachedPolicies": ["LakehouseAccess"]}],
+         "policies": [{"name": "LakehouseAccess", "document": {"Version": "2012-10-17", "Statement": [
+           {"Effect": "Allow", "Action": "s3:*", "Resource": ["arn:aws:s3:::$$S3_BUCKET", "arn:aws:s3:::$$S3_BUCKET/*"]}]}}]}
         EOF
-        exec weed server -dir=/data -ip=seaweedfs -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024 -s3 -s3.port=8333 -s3.config=/tmp/s3.json
+        exec weed server -dir=/data -ip=seaweedfs -ip.bind=0.0.0.0 -master.volumeSizeLimitMB=1024 -s3 -s3.port=8333 -s3.config=/tmp/s3.json -s3.iam.config=/tmp/s3.json
     volumes:
       - seaweedfs-data:/data
     healthcheck:
@@ -360,29 +381,103 @@ services:
       - fraud-detection-network
     restart: unless-stopped
 
-  # Iceberg REST catalog: tracks which metadata file is the current version of each table
-  iceberg-rest:
-    image: apache/iceberg-rest-fixture:1.9.1
-    container_name: iceberg_rest_1
-    hostname: iceberg-rest
-    user: root
+  # Iceberg REST catalog: tracks which metadata file is the current version of each table,
+  # with its state in Postgres, and vends short-lived storage credentials to engines
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:v0.13.8
+    container_name: lakekeeper_1
+    hostname: lakekeeper
+    command: ["serve"]
     ports:
-      - "8181:8181"
+      - "8181:8181"     # REST catalog (/catalog), management API and UI (/ui)
     environment:
-      CATALOG_WAREHOUSE: s3://warehouse/
-      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
-      CATALOG_S3_PATH__STYLE__ACCESS: "true"
-      # catalog state in SQLite on a volume, so tables survive restarts
-      CATALOG_URI: jdbc:sqlite:file:/catalog/iceberg_catalog.db
-      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
-      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
-      AWS_REGION: us-east-1
-    volumes:
-      - iceberg-catalog:/catalog
+      <<: *lakekeeper-env
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 5s
     depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
       seaweedfs:
         condition: service_healthy
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # One-shot job: creates or upgrades the catalog's database schema
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:v0.13.8
+    container_name: lakekeeper_migrate_1
+    command: ["migrate"]
+    environment:
+      <<: *lakekeeper-env
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    networks:
+      - fraud-detection-network
+    restart: "no"
+
+  # One-shot job: bootstraps Lakekeeper and creates the lakehouse warehouse
+  lakekeeper-init:
+    build:
+      context: ./lakehouse/
+      additional_contexts: *platform-contexts
+    container_name: lakekeeper_init_1
+    command: ["python", "-u", "lakekeeper_init.py"]
+    environment:
+      <<: *lakehouse-env
+      LAKEKEEPER_URL: http://lakekeeper:8181
+    depends_on:
+      lakekeeper:
+        condition: service_healthy
+    networks:
+      - fraud-detection-network
+    restart: "no"
+
+  # The catalog's own database, apart from the application's Postgres
+  lakekeeper-db:
+    image: postgres:17-alpine
+    container_name: lakekeeper_db_1
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: ${LAKEKEEPER_DB_PASSWORD:-lakekeeper-dev-password}
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d lakekeeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - lakekeeper-db-data:/var/lib/postgresql/data
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # SQL query engine over the lakehouse tables (http://localhost:8085)
+  trino:
+    image: trinodb/trino:484
+    container_name: trino
+    hostname: trino
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/queries.sql:/etc/trino/queries.sql:ro
+    # the JVM sizes its heap from this limit
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:8080/v1/info"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    depends_on:
+      lakekeeper-init:
+        condition: service_completed_successfully
     networks:
       - fraud-detection-network
     restart: unless-stopped
@@ -410,8 +505,8 @@ services:
         condition: service_completed_successfully
       schema-init:
         condition: service_completed_successfully
-      iceberg-rest:
-        condition: service_started
+      lakekeeper-init:
+        condition: service_completed_successfully
     networks:
       - fraud-detection-network
     restart: unless-stopped
@@ -433,8 +528,8 @@ services:
         condition: service_completed_successfully
       schema-init:
         condition: service_completed_successfully
-      iceberg-rest:
-        condition: service_started
+      lakekeeper-init:
+        condition: service_completed_successfully
     networks:
       - fraud-detection-network
     restart: unless-stopped
@@ -452,8 +547,8 @@ services:
       MAINTENANCE_INTERVAL_SECONDS: ${MAINTENANCE_INTERVAL_SECONDS:-3600}
       METRICS_PORT: 8003
     depends_on:
-      iceberg-rest:
-        condition: service_started
+      lakekeeper-init:
+        condition: service_completed_successfully
     networks:
       - fraud-detection-network
     restart: unless-stopped
@@ -496,7 +591,7 @@ services:
 volumes:
   kafka-data:
   seaweedfs-data:
-  iceberg-catalog:
+  lakekeeper-db-data:
   prometheus-data:
   grafana-data:
   alertmanager-data:

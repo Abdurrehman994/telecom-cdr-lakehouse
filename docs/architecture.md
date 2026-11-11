@@ -43,14 +43,17 @@ flowchart LR
     ML1 & ML2 & LW -->|unprocessable| DLQ[(cdr-events-dlq)]
     LD -->|unprocessable| DLQ2[(fraud-decisions-dlq)]
 
-    LW & LD -->|commit snapshot| CAT[Iceberg REST catalog]
-    LW & LD -->|Parquet files| S3[(SeaweedFS<br/>S3 API)]
+    LW & LD -->|commit snapshot| CAT[Lakekeeper<br/>Iceberg REST catalog]
+    CAT --- KDB[(Postgres<br/>catalog state)]
+    CAT -.->|vends short-lived credentials| LW & LD & TR
+    LW & LD -->|Parquet files| S3[(SeaweedFS<br/>S3 API + STS)]
     CAT -->|metadata files| S3
     MT[lakehouse-maintenance<br/>every sink's table] -->|compact, expire snapshots| CAT
     MT -->|delete orphan files| S3
 
+    TR[Trino] --> CAT
+    TR --> S3
     Q[query.py<br/>DuckDB] --> CAT
-    Q --> S3
 ```
 
 One topic, two independent consumer groups. Fraud detection and the lakehouse each read every CDR at their own pace, and neither can slow down or block the other. Fraud detection in turn publishes its decisions as events, which a second sink lands in the lakehouse next to the CDRs.
@@ -69,9 +72,10 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 | `postgres` | PostgreSQL 15 | OLTP store for fraud alerts and their case status; schema in `postgres/init/` |
 | `lakehouse-writer`, `lakehouse-writer-fraud-decisions` | Python, PyIceberg, PyArrow | One process per sink in [`lakehouse/sinks/`](../fraud-detection-system/lakehouse/sinks/): streams a topic into an Iceberg table (`telecom.cdr_events`, `telecom.fraud_decisions`) |
 | `lakehouse-maintenance` | Python, PyIceberg | Hourly compaction, snapshot expiry and orphan file cleanup for every sink's table, with each sink's policy |
-| `iceberg-rest` | Apache Iceberg REST catalog 1.9.1 | Tracks the current metadata file of each table; state kept in SQLite on a volume |
+| `lakekeeper` | Lakekeeper 0.13.8 (Rust) | Iceberg REST catalog: tracks the current metadata file of each table, keeps its state in its own Postgres (`lakekeeper-db`), and vends short-lived storage credentials. `lakekeeper-migrate` and `lakekeeper-init` create its schema and the `lakehouse` warehouse |
+| `trino` | Trino 484 | Distributed SQL engine over the lakehouse tables, with no storage keys of its own |
 | `seaweedfs` | SeaweedFS 4.51 | S3-compatible object storage for Parquet data and Iceberg metadata |
-| `query.py` | DuckDB | Analytical (OLAP) queries and snapshot time travel |
+| `query.py` | DuckDB | Analytical queries in a single process, and snapshot time travel |
 | `kafka-exporter` | kafka-exporter 1.9.0 | Consumer lag per group and topic offsets, for Prometheus |
 | Prometheus, Grafana, Alertmanager | | Metrics from every service, the provisioned "CDR Pipeline" dashboard, pipeline alerts and fraud alerts |
 
@@ -81,7 +85,7 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 2. **Partition.** Kafka hashes the key, so all CDRs of one customer land in the same partition, in the order they were produced.
 3. **Detect fraud.** The `fraud-detection` group splits the 3 partitions between the two `ml-service` replicas. Each CDR goes through rules, a random forest score, and the LLM if the score is uncertain. A fraud decision is stored in Postgres; if the row is new, Alertmanager is notified. Analysts list alerts and record decisions (`confirmed`, `dismissed`) through the alerts API. Every decision, fraud or not, is published to `fraud-decisions`.
 4. **Write to the lakehouse.** Each sink's writer reads its topic as its own consumer group. It buffers rows and appends a batch to Iceberg every 500 rows or 10 seconds (set in the sink file). Each append creates a new snapshot.
-5. **Analyse.** `query.py` loads the current snapshot (or an earlier one) and runs SQL with DuckDB, including a join of CDRs with the decisions made on them.
+5. **Analyse.** Trino queries the tables through the same catalog, with partition pruning, joins across tables and Iceberg's metadata tables. `query.py` does the same in a single process with DuckDB.
 
 ## Design decisions
 
@@ -222,9 +226,29 @@ Under load, compaction lost three commit races in a row against the writer, retr
 
 Two implementation notes. PyIceberg's `dynamic_partition_overwrite` would be the natural API, but it only supports identity partitions, not `day()`. And a first version passed one filter of many OR'd days per commit; planning that filter grew superlinearly (20 days over 5,000 files took 31 seconds), so each commit now uses a single date range, which plans in about 3 seconds. Days inside a range that did not need compaction are rewritten with it, so nothing in the range is deleted without being rewritten.
 
+### Lakekeeper as the catalog
+
+The catalog is the one piece every engine shares: it decides which metadata file is a table's current version, and it is where a commit either succeeds or conflicts. The first version used `iceberg-rest-fixture`, the Iceberg project's reference server, which keeps its state in SQLite. SQLite allows one writer at a time, and the fixture does not wait for the lock. With two sinks and maintenance committing at once, commits failed with `SQLITE_BUSY`, and the lock stayed held until the catalog was restarted. The sinks lost nothing (a failed commit leaves the offsets in Iceberg unchanged), but no table could be written either.
+
+[Lakekeeper](https://lakekeeper.io) replaced it:
+
+- **State in Postgres.** Concurrent commits are serialised by row locks, and a commit based on an outdated snapshot fails with an ordinary Iceberg conflict, which the sinks and compaction already retry.
+- **Vended credentials.** Lakekeeper holds the storage keys. When an engine loads a table, Lakekeeper gets short-lived credentials for it from SeaweedFS's STS (`AssumeRole`) and returns them with the table. Trino has no storage keys at all. Remote signing, the other option, is disabled: S3-compatible stores do not check every field of a signed request, so a client could alter one.
+- **A path to production.** Authentication through OpenID Connect and fine-grained permissions through OpenFGA, both off in this local setup. Lakekeeper is open source (Apache 2.0) and written in Rust, so the server is one small binary.
+
+Apache Polaris and Nessie were the alternatives. Polaris is the Iceberg project's own catalog but needs more to bootstrap; Nessie's Git-like branches are not something this platform needs yet.
+
+**Moving the tables.** An Iceberg table is fully described by its metadata file in object storage, including its snapshots and the sinks' Kafka positions. [`migrate_catalog.py`](../fraud-detection-system/lakehouse/migrate_catalog.py) moves each table by registering that file in the new catalog, without copying data. On the local stack, with the sinks stopped: both tables were registered at the same snapshots (1,621 and 800 rows), and on restart the sinks resumed at exactly their stored offsets (248, 328 and 224) because the topic ids still matched. 800 more CDRs then landed, and the offsets advanced by exactly 800.
+
+**Tested under the load that broke SQLite.** On a fresh stack, 4,800 CDRs were sent while compaction ran three times over both tables. Compaction lost three commit races to the sinks: Lakekeeper rejected the stale commits as conflicts and compaction retried. Afterwards each table held 4,800 rows at 4,800 distinct Kafka positions, the stored offsets summed to 4,800, and the sinks, maintenance and catalog logged no errors.
+
+### Trino for queries
+
+DuckDB loads a snapshot into one process's memory, which suits a laptop and a few thousand rows. Trino is the engine for scans that do not fit one machine: it plans a query against Iceberg's metadata, prunes partitions and files, and spreads the reading over its workers. Here it runs as a single node, reading the same tables through Lakekeeper with vended credentials. [`trino/queries.sql`](../fraud-detection-system/trino/queries.sql) has examples: aggregates, the join of decisions with CDRs, a query that reads a single day partition, and the sinks' commits from the `$snapshots` metadata table, Kafka offsets included.
+
 ### SeaweedFS for object storage
 
-Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO was the first choice, but its Docker images are no longer published. SeaweedFS is Apache-licensed, runs as a single container, and is a drop-in replacement for local development. In the cloud this would be Amazon S3 or an equivalent.
+Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO was the first choice, but its Docker images are no longer published. SeaweedFS is Apache-licensed, runs as a single container, and is a drop-in replacement for local development. It also implements STS `AssumeRole`, which Lakekeeper uses to vend credentials: a role whose policy allows access to the `warehouse` bucket only. In the cloud this would be Amazon S3 or an equivalent, with IAM roles scoped per table.
 
 ## Delivery guarantees
 
@@ -291,6 +315,7 @@ Every service exports Prometheus metrics, and Grafana loads the **CDR Pipeline**
 | `ml-service` (`/metrics`) | CDRs processed by outcome; fraud by detection method; LLM calls skipped by the circuit breaker; duplicate alerts skipped |
 | Each sink's writer (`:8002`) | Rows appended and skipped; Iceberg commit duration; commit conflicts; failed Kafka offset commits; dead-lettered messages; columns added by contract changes; buffered rows; time of last commit |
 | `lakehouse-maintenance` (`:8003`) | Data files, rows, bytes and snapshots per table; files compacted; snapshots expired; orphan files deleted; last success and failures per task and table |
+| `lakekeeper` (`:9000`) | Catalog requests by endpoint and status, and their latency |
 
 Lakehouse metrics carry a `table` label, and the dashboard has a table picker for the lakehouse panels. The writer's last-commit metric also carries `consumergroup` and `topic`, matching kafka-exporter's labels, so `LakehouseWriterNotCommitting` joins each sink with its own consumer lag and works for any new sink without a rule change.
 
@@ -358,9 +383,11 @@ Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like t
 - **Flat contracts only.** Sinks reject nested records, arrays and maps. Iceberg supports them; mapping them is future work.
 - **Compaction competes with the writer.** PyIceberg rejects a commit whenever anything else committed since it read the table, even an append to an unrelated partition. Under constant writes, compaction can retry several times (it lost three races in a row in testing) and could give up after five. Iceberg's Java implementation validates conflicts per file instead, so non-overlapping appends do not block a rewrite; Spark's `rewrite_data_files` would avoid this.
 - **Compaction holds a range in memory.** Each commit reads up to 50 day partitions into memory before rewriting them. Fine at this scale; larger tables need smaller ranges or a distributed engine.
-- **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication. SQLite allows one writer at a time, and the fixture does not wait for its lock. When the stack was upgraded to two sinks plus maintenance, their concurrent commits failed with `SQLITE_BUSY`, and the lock stayed held until the catalog was restarted. The sinks lost nothing (a failed commit leaves the offsets in Iceberg unchanged, so they re-read the batch), but they could not write either. A catalog backed by Postgres removes this.
+- **No authentication on the catalog.** Lakekeeper runs with authentication off and allows every request; anyone who can reach it can create or drop tables. It supports OpenID Connect and OpenFGA for this.
+- **One storage role for every table.** Vended credentials can access the whole `warehouse` bucket, not just the table they were vended for.
 - **One registry, no authentication.** Anyone who can reach the registry can register a schema or change a compatibility level. The contracts job is the intended path, but nothing enforces it.
-- **DuckDB loads the snapshot into memory.** Fine for this data volume, not for large tables.
+- **DuckDB loads the snapshot into memory.** Fine for this data volume, not for large tables; Trino is the engine for those.
+- **Trino runs as one node.** It shows the integration, not scale-out; workers are added as separate containers.
 
 ## Path to production
 
@@ -368,9 +395,9 @@ Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like t
 |---|---|---|
 | Kafka | 1 broker, replication factor 1 | 3+ brokers, replication factor 3, `min.insync.replicas=2`, rack awareness |
 | Schemas | Avro contracts, one registry, registered by a job at startup | A replicated registry with authentication, where only CI can register; contract changes checked against the production registry before merge |
-| Catalog | `iceberg-rest-fixture`, SQLite | Apache Polaris, Lakekeeper or Nessie, backed by Postgres, with access control |
+| Catalog | Lakekeeper on Postgres, authentication off, vended credentials from SeaweedFS STS | Lakekeeper with OpenID Connect and OpenFGA, a replicated Postgres with backups, credentials from the cloud's STS scoped to each table |
 | Storage | SeaweedFS, one container | S3 or equivalent, with lifecycle rules |
-| Query engine | DuckDB, in memory | Trino or Spark for large scans; DuckDB for local analysis |
+| Query engine | Trino, one node; DuckDB in process | A Trino cluster (coordinator and autoscaled workers) or Spark for large scans; DuckDB for local analysis |
 | Lakehouse writes | Python writer per sink, configured by YAML | The same sink files driving the Kafka Connect Iceberg sink or Flink, for higher throughput |
 | Table maintenance | Python job: compaction, snapshot expiry, orphan cleanup, every hour | The same jobs in Spark (`rewrite_data_files`, `expire_snapshots`, `remove_orphan_files`) or the catalog's managed maintenance, scheduled by an orchestrator |
 | OLTP | One Postgres container, schema from an init script | Managed Postgres with replicas and backups; schema migrations with a tool such as Alembic or Flyway |
@@ -396,8 +423,13 @@ python ingest-auto/ingest-auto.py --batch-size 50
 # Consumer lag for both groups (LAG should reach 0)
 docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
 
-# Query the lakehouse: row counts, duplicates, fraud by type, decisions joined with CDRs, time travel
+# Query the lakehouse with Trino: aggregates, a join of the two sinks' tables, partition pruning, metadata tables
+docker exec trino trino --catalog lakehouse --schema telecom -f /etc/trino/queries.sql
+
+# The same tables with DuckDB, plus time travel
 docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
+
+# Catalog UI: http://localhost:8181/ui
 
 # Table health: snapshots, data files, rows, bytes
 docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py stats

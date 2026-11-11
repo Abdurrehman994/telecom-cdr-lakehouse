@@ -14,6 +14,8 @@ from sink_config import SinkConfig
 
 logger = logging.getLogger("lakehouse")
 
+ICEBERG_CATALOG_URI = os.getenv("ICEBERG_CATALOG_URI", "http://lakekeeper:8181/catalog")
+ICEBERG_WAREHOUSE = os.getenv("ICEBERG_WAREHOUSE", "lakehouse")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://seaweedfs:8333")
 S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "lakehouse")
 S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "lakehouse-secret")
@@ -40,14 +42,19 @@ def ensure_bucket():
 
 
 def load_iceberg_catalog():
-    """connect to the Iceberg REST catalog, retrying until it is up"""
-    for attempt in range(30):
+    """connect to the Iceberg REST catalog (Lakekeeper), retrying until it is up.
+
+    Table data is read and written with short-lived credentials that the catalog vends
+    with each table; the static keys here are only a fallback for catalogs that vend none.
+    """
+    for _ in range(30):
         try:
             catalog = load_catalog(
                 "lakehouse",
                 **{
                     "type": "rest",
-                    "uri": os.getenv("ICEBERG_CATALOG_URI", "http://iceberg-rest:8181"),
+                    "uri": ICEBERG_CATALOG_URI,
+                    "warehouse": ICEBERG_WAREHOUSE,
                     "s3.endpoint": S3_ENDPOINT,
                     "s3.access-key-id": S3_ACCESS_KEY_ID,
                     "s3.secret-access-key": S3_SECRET_ACCESS_KEY,

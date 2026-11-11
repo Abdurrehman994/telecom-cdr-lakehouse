@@ -36,6 +36,11 @@ scrape_configs:
     static_configs:
       - targets: ['lakehouse-writer:8002', 'lakehouse-writer-fraud-decisions:8002']
 
+  # Iceberg REST catalog: request rates and latencies
+  - job_name: 'lakekeeper'
+    static_configs:
+      - targets: ['lakekeeper:9000']
+
   - job_name: 'lakehouse-maintenance'
     static_configs:
       - targets: ['lakehouse-maintenance:8003']

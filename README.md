@@ -15,7 +15,9 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
                             ├─► ml-service ×2 ─► Postgres (fraud_alerts) ─► Alertmanager
                             │        └─► Kafka (fraud-decisions)
                             │                └─► sink: fraud_decisions ─┐
-                            └─► sink: cdr_events ───────────────────────┴─► Iceberg on S3 (SeaweedFS) ─► DuckDB
+                            └─► sink: cdr_events ───────────────────────┴─► Iceberg on S3 (SeaweedFS)
+                                                                                  catalog: Lakekeeper (Postgres)
+                                                                                  query: Trino, DuckDB
 ```
 
 ## Highlights
@@ -26,7 +28,8 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
 - **Idempotent fraud alerts.** Alerts are keyed by `transaction_id`, so replaying the topic creates no duplicate alerts or notifications.
 - **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
 - **Failure handling.** A dead-letter topic for bad messages, retries with backoff when Postgres is down, and consumer rebalancing when a replica stops. Each was tested.
-- **OLTP and OLAP side by side.** Postgres for alert case management, Iceberg and DuckDB for analytics and snapshot time travel.
+- **OLTP and OLAP side by side.** Postgres for alert case management; Iceberg tables in a Lakekeeper catalog, queried with Trino or DuckDB, for analytics and snapshot time travel.
+- **Production-grade catalog.** Lakekeeper keeps catalog state in Postgres and vends short-lived storage credentials, so engines such as Trino hold no storage keys. It replaced a SQLite-backed catalog that failed under concurrent commits; the tables moved over without copying data.
 - **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup, safe to run while the writer commits. After a load test it turned 5,081 small files into 301.
 - **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard.
 - **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the test found and fixed two bottlenecks in fraud detection.
@@ -207,12 +210,18 @@ Open your web browser and navigate to:
 - **Sinks**: one writer per file in `fraud-detection-system/lakehouse/sinks/`. `lakehouse-writer` streams `cdr-events` into `telecom.cdr_events`, and `lakehouse-writer-fraud-decisions` streams `fraud-decisions` into `telecom.fraud_decisions`; both are partitioned by day. Each sink reads its topic as its own consumer group
 - **Columns**: one per field of the topic's contract, plus `kafka_partition`, `kafka_offset` and `ingested_at`
 - **Storage**: SeaweedFS (S3 API at http://localhost:8333), bucket `warehouse`, Parquet data files
-- **Catalog**: Iceberg REST catalog at http://localhost:8181
+- **Catalog**: Lakekeeper, an Iceberg REST catalog, at http://localhost:8181/catalog (warehouse `lakehouse`); UI at http://localhost:8181/ui
 - **Exactly-once**: Kafka offsets are stored in each Iceberg snapshot, and the writer resumes from them after a restart, so replays never duplicate rows
-- **Analytics (OLAP)**: run DuckDB queries, including time travel to an earlier snapshot:
+- **Analytics (OLAP)** with Trino (web UI at http://localhost:8085):
+  ```bash
+  docker exec -it trino trino --catalog lakehouse --schema telecom     # interactive SQL
+  docker exec trino trino --catalog lakehouse --schema telecom -f /etc/trino/queries.sql
+  ```
+  or with DuckDB, including time travel to an earlier snapshot:
   ```bash
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
   ```
+- **Upgrading a stack that still has `iceberg-rest`**: stop the sinks and maintenance, start `lakekeeper-init`, run `python migrate_catalog.py --source-uri http://iceberg-rest:8181` in a lakehouse container, then `docker compose up -d --remove-orphans`. See [docs/architecture.md](docs/architecture.md#lakekeeper-as-the-catalog)
 - **Maintenance**: `lakehouse-maintenance` compacts small files, expires old snapshots and deletes unreferenced files every hour, for every sink's table, with the policy in its sink file. To check the tables or run a job now (`--sink cdr_events` limits it to one):
   ```bash
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py stats
@@ -376,6 +385,16 @@ docker compose -f docker-compose.system.yml logs -f
 | Prometheus | 9090 | http://localhost:9090 | Metrics collection & queries |
 | Node Exporter | 9100 | http://localhost:9100/metrics | System metrics |
 | Alertmanager | 9093 | http://localhost:9093 | Alert management |
+| Ingestion API | 8080 | http://localhost:8080/docs | Send CDRs |
+| Schema Registry | 8081 | http://localhost:8081/subjects | Data contracts |
+| Lakekeeper | 8181 | http://localhost:8181/ui | Iceberg REST catalog and its UI |
+| Trino | 8085 | http://localhost:8085/ui | SQL over the lakehouse |
+| SeaweedFS | 8333 | http://localhost:8333 | S3 API |
+| Ingestion API | 8080 | http://localhost:8080/docs | Send CDRs |
+| Schema Registry | 8081 | http://localhost:8081/subjects | Data contracts |
+| Lakekeeper | 8181 | http://localhost:8181/ui | Iceberg REST catalog and its UI |
+| Trino | 8085 | http://localhost:8085/ui | SQL over the lakehouse |
+| SeaweedFS | 8333 | http://localhost:8333 | S3 API |
 
 ---
 
