@@ -1,3 +1,94 @@
-﻿groups:
-  - name: system_alerts
-    rules: []
+groups:
+  - name: pipeline
+    rules:
+      - alert: ConsumerLagHigh
+        expr: sum by (consumergroup) (kafka_consumergroup_lag{topic="cdr-events"}) > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $labels.consumergroup }} is {{ $value }} CDRs behind"
+
+      - alert: ConsumerGroupStalled
+        # behind, and not moving at all
+        expr: |
+          sum by (consumergroup) (kafka_consumergroup_lag{topic="cdr-events"}) > 0
+          and sum by (consumergroup) (delta(kafka_consumergroup_current_offset{topic="cdr-events"}[10m])) == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.consumergroup }} has made no progress for 10 minutes"
+
+      - alert: DeadLetterMessages
+        expr: sum(delta(kafka_topic_partition_current_offset{topic="cdr-events-dlq"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} messages sent to cdr-events-dlq in the last 15 minutes"
+
+      - alert: IngestPublishFailures
+        expr: sum(rate(cdr_ingest_total{result="publish_failed"}[5m])) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Ingestion cannot publish CDRs to Kafka; clients are getting 503s"
+
+      - alert: LakehouseWriterNotCommitting
+        expr: |
+          (time() - lakehouse_last_commit_timestamp_seconds > 300)
+          and on() (sum(kafka_consumergroup_lag{consumergroup="lakehouse-writer", topic="cdr-events"}) > 0)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The lakehouse writer has CDRs to write but has not committed for 5 minutes"
+
+      - alert: LakehouseCommitConflicts
+        expr: increase(lakehouse_commit_conflicts_total[15m]) > 10
+        labels:
+          severity: warning
+        annotations:
+          summary: "Writer appends keep conflicting with other commits"
+
+      - alert: LLMUnavailable
+        expr: sum(rate(llm_skipped_total[5m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Uncertain CDRs are scored without the LLM (circuit breaker open)"
+
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "{{ $labels.job }} ({{ $labels.instance }}) is not reachable"
+
+  - name: lakehouse-table
+    rules:
+      - alert: LakehouseSmallFiles
+        expr: lakehouse_table_data_files > 1000 and (lakehouse_table_bytes / lakehouse_table_data_files) < 1048576
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} data files averaging under 1 MB; compaction is not keeping up"
+
+      - alert: LakehouseMaintenanceFailing
+        expr: increase(lakehouse_maintenance_failures_total[2h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Maintenance task {{ $labels.task }} failed"
+
+      - alert: LakehouseMaintenanceNotRunning
+        expr: time() - lakehouse_maintenance_last_success_timestamp_seconds > 3 * 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Maintenance task {{ $labels.task }} has not succeeded for 3 hours"

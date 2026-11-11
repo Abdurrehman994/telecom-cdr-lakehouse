@@ -21,6 +21,7 @@ import os
 fraud_detected = Counter('fraud_detected_total', 'Frauds detected', ['method', 'fraud_type'])
 llm_latency = Histogram('llm_analysis_duration_seconds', 'LLM analysis time')
 cdr_processed = Counter('cdr_processed_total', 'Total CDRs processed', ['status'])
+llm_skipped = Counter('llm_skipped_total', 'Uncertain CDRs scored without the LLM because it recently failed')
 duplicate_alerts_skipped = Counter('duplicate_alerts_skipped_total', 'Redelivered CDRs whose alert was already stored')
 
 # FastAPI app
@@ -208,6 +209,7 @@ class FraudDetectionEngine:
     def llm_validate(self, cdr: Dict, ml_score: float) -> Dict:
         """use LLM for uncertain cases"""
         if time.monotonic() < self.llm_unavailable_until:
+            llm_skipped.inc()
             return self._score_fallback(ml_score)
 
         prompt = self.create_llm_prompt(cdr, ml_score)

@@ -1,11 +1,13 @@
 """FastAPI application for CDR Ingestion Service"""
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, status
 from fastapi.concurrency import run_in_threadpool
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_latest
 
 from app.config import settings
 from app.schemas import CDRRecord, CDRIngestionResponse, HealthResponse
@@ -21,6 +23,14 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+# Prometheus metrics
+cdrs_ingested = Counter("cdr_ingest_total", "CDRs received over HTTP, by result", ["result"])
+publish_seconds = Histogram(
+    "cdr_ingest_publish_seconds", "Wait for Kafka to confirm one request's CDRs",
+    buckets=(0.01, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 20),
+)
 
 
 # Global instances
@@ -118,6 +128,7 @@ async def ingest_cdr(record: CDRRecord):
         cdr_dict = record.model_dump(exclude_none=True)
         is_valid, validation_msg = validate_cdr(cdr_dict)
         if not is_valid:
+            cdrs_ingested.labels("invalid").inc()
             logger.warning(f"CDR validation failed for {record.transaction_id}: {validation_msg}")
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -156,13 +167,17 @@ async def ingest_cdr(record: CDRRecord):
         # Publish to Kafka and only answer once the broker has stored the CDR,
         # so a 202 never hides a lost record. The wait blocks, so it runs off the event loop.
         publisher_instance = get_publisher()
+        started = time.monotonic()
         error = await run_in_threadpool(publisher_instance.publish, enriched_cdr)
+        publish_seconds.observe(time.monotonic() - started)
         if error is not None:
+            cdrs_ingested.labels("publish_failed").inc()
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"Could not publish CDR to Kafka, retry later: {error}"
             )
 
+        cdrs_ingested.labels("accepted").inc()
         logger.info(f"Successfully ingested CDR {record.transaction_id}")
 
         return CDRIngestionResponse(
@@ -203,6 +218,7 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
             is_valid, validation_msg = validate_cdr(cdr_dict)
             
             if not is_valid:
+                cdrs_ingested.labels("invalid").inc()
                 results["rejected"] += 1
                 results["errors"].append({
                     "index": idx,
@@ -221,6 +237,7 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
             to_publish.append((idx, record.transaction_id, enriched_cdr))
 
         except Exception as e:
+            cdrs_ingested.labels("invalid").inc()
             results["rejected"] += 1
             results["errors"].append({
                 "index": idx,
@@ -229,13 +246,17 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
             })
 
     # Send the whole batch, then wait once for all broker confirmations
+    started = time.monotonic()
     errors = await run_in_threadpool(
         publisher_instance.publish_batch, [cdr for _, _, cdr in to_publish]
     )
+    publish_seconds.observe(time.monotonic() - started)
     for (idx, transaction_id, _), error in zip(to_publish, errors):
         if error is None:
+            cdrs_ingested.labels("accepted").inc()
             results["accepted"] += 1
         else:
+            cdrs_ingested.labels("publish_failed").inc()
             results["rejected"] += 1
             results["errors"].append({
                 "index": idx,
@@ -246,6 +267,12 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
     logger.info(f"Batch processing complete: {results['accepted']} accepted, {results['rejected']} rejected")
     
     return results
+
+
+@app.get("/metrics", tags=["Monitoring"])
+async def metrics():
+    """Prometheus metrics"""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/stats", tags=["Monitoring"])

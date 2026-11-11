@@ -1,3 +1,12 @@
+# shared by the lakehouse writer and the maintenance job
+x-lakehouse-env: &lakehouse-env
+  ICEBERG_CATALOG_URI: http://iceberg-rest:8181
+  ICEBERG_TABLE: telecom.cdr_events
+  S3_ENDPOINT: http://seaweedfs:8333
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
+  S3_BUCKET: warehouse
+
 services:
   prometheus:
     image: prom/prometheus:latest
@@ -33,7 +42,6 @@ services:
       - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
       - GF_USERS_ALLOW_SIGN_UP=false
       - GF_SERVER_ROOT_URL=http://localhost:3000
-      - GF_INSTALL_PLUGINS=grafana-piechart-panel
     ports:
       - "3000:3000"
     networks:
@@ -317,23 +325,53 @@ services:
     build: ./lakehouse/
     container_name: lakehouse_writer_1
     environment:
+      <<: *lakehouse-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: cdr-events
       KAFKA_GROUP_ID: lakehouse-writer
       KAFKA_DLQ_TOPIC: cdr-events-dlq
-      ICEBERG_CATALOG_URI: http://iceberg-rest:8181
-      ICEBERG_TABLE: telecom.cdr_events
-      S3_ENDPOINT: http://seaweedfs:8333
-      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
-      S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
-      S3_BUCKET: warehouse
-      FLUSH_MAX_RECORDS: 500
-      FLUSH_INTERVAL_SECONDS: 10
+      # bigger batches mean fewer, larger files and fewer snapshots, but data reaches
+      # the lakehouse later; compaction cleans up what small commits leave behind
+      FLUSH_MAX_RECORDS: ${LAKEHOUSE_FLUSH_MAX_RECORDS:-500}
+      FLUSH_INTERVAL_SECONDS: ${LAKEHOUSE_FLUSH_INTERVAL_SECONDS:-10}
+      METRICS_PORT: 8002
     depends_on:
       kafka-init:
         condition: service_completed_successfully
       iceberg-rest:
         condition: service_started
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # Iceberg table maintenance on a schedule: compaction, snapshot expiry, orphan files
+  lakehouse-maintenance:
+    build: ./lakehouse/
+    container_name: lakehouse_maintenance_1
+    command: ["python", "-u", "maintenance.py", "loop"]
+    environment:
+      <<: *lakehouse-env
+      MAINTENANCE_INTERVAL_SECONDS: ${MAINTENANCE_INTERVAL_SECONDS:-3600}
+      COMPACT_MIN_FILES: 5
+      SNAPSHOT_RETAIN_LAST: 10
+      SNAPSHOT_MAX_AGE_HOURS: 24
+      ORPHAN_MIN_AGE_MINUTES: 1440
+      METRICS_PORT: 8003
+    depends_on:
+      iceberg-rest:
+        condition: service_started
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # Consumer lag per group and topic offsets (ingest and DLQ rates) for Prometheus
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.9.0
+    container_name: kafka_exporter_1
+    command: ["--kafka.server=kafka:9092"]
+    depends_on:
+      kafka:
+        condition: service_healthy
     networks:
       - fraud-detection-network
     restart: unless-stopped
