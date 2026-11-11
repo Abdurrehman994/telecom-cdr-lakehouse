@@ -3,11 +3,14 @@ import json
 import logging
 import os
 import time
-from typing import Dict
+from dataclasses import dataclass
+from typing import Dict, Optional
 
 from pyarrow import fs
 from pyiceberg.catalog import load_catalog
 from pyiceberg.table import Table
+
+from sink_config import SinkConfig
 
 logger = logging.getLogger("lakehouse")
 
@@ -60,17 +63,37 @@ def load_iceberg_catalog():
     raise RuntimeError("Could not connect to the Iceberg catalog")
 
 
-def stored_offsets(table: Table, offsets_property: str) -> Dict[str, int]:
-    """the Kafka offsets of the newest snapshot that recorded them.
+@dataclass(frozen=True)
+class KafkaPosition:
+    """where a sink is in its topic, as recorded in an Iceberg snapshot.
 
-    Every writer commit records them, and compaction copies them forward. Walking
+    Offsets only mean something for the topic they were read from: a topic that is
+    deleted and created again starts at offset 0. So the topic's id is stored with them.
+    """
+    # next offset to read, per partition
+    offsets: Dict[str, int]
+    # None in snapshots written before topic ids were recorded
+    topic_id: Optional[str]
+
+    def snapshot_properties(self, sink: SinkConfig) -> Dict[str, str]:
+        properties = {sink.offsets_property: json.dumps(self.offsets)}
+        if self.topic_id is not None:
+            properties[sink.topic_id_property] = self.topic_id
+        return properties
+
+
+def stored_position(table: Table, sink: SinkConfig) -> KafkaPosition:
+    """the Kafka position of the newest snapshot that recorded one.
+
+    Every writer commit records it, and compaction copies it forward. Walking
     back through the history also covers a snapshot made by another tool that did not.
     """
     snapshot = table.current_snapshot()
     while snapshot is not None:
-        raw = snapshot.summary.additional_properties.get(offsets_property) if snapshot.summary else None
-        if raw:
-            return json.loads(raw)
+        properties = snapshot.summary.additional_properties if snapshot.summary else {}
+        if properties.get(sink.offsets_property):
+            return KafkaPosition(json.loads(properties[sink.offsets_property]),
+                                 properties.get(sink.topic_id_property))
         parent = snapshot.parent_snapshot_id
         snapshot = table.snapshot_by_id(parent) if parent is not None else None
-    return {}
+    return KafkaPosition({}, None)

@@ -79,6 +79,11 @@ class SinkConfig:
         return f"kafka.{self.topic}.offsets"
 
     @property
+    def topic_id_property(self) -> str:
+        """snapshot property that holds the id of the topic those offsets belong to"""
+        return f"kafka.{self.topic}.topic-id"
+
+    @property
     def compaction_partition(self) -> Optional[PartitionField]:
         """the day partition that compaction rewrites by, if the table has one"""
         return next((p for p in self.partition_by if p.transform == COMPACTION_TRANSFORM), None)

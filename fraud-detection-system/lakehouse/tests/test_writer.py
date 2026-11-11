@@ -5,11 +5,11 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
-from confluent_kafka import KafkaError, KafkaException, TopicPartition
+from confluent_kafka import OFFSET_BEGINNING, KafkaError, KafkaException, TopicPartition
 from pyiceberg.exceptions import CommitFailedException
 
 import writer
-from catalog import stored_offsets
+from catalog import KafkaPosition, stored_position
 from conftest import LAKEHOUSE, contract_json
 from sink_config import load_sink
 from table_schema import RowBuilder, iceberg_schema
@@ -18,16 +18,25 @@ from writer import LakehouseWriter, SinkMetrics
 SINK = load_sink(str(LAKEHOUSE / "sinks" / "cdr_events.yaml"))
 OFFSETS_PROPERTY = SINK.offsets_property
 SCHEMA = iceberg_schema(contract_json("cdr-events"))
+TOPIC_ID = "topic-A"
 
 
 class FakeTable:
-    """Keeps the offsets of the latest snapshot, like the Iceberg snapshot property."""
+    """Keeps the snapshot properties of the latest commit: the offsets and the topic id."""
 
-    def __init__(self, offsets=None, fail_append=False, conflicts=0):
-        self.offsets = offsets
+    def __init__(self, offsets=None, topic_id=TOPIC_ID, fail_append=False, conflicts=0):
+        self.properties = KafkaPosition(offsets, topic_id).snapshot_properties(SINK) if offsets is not None else None
         self.fail_append = fail_append
         self.conflicts = conflicts
         self.appends = []
+
+    @property
+    def offsets(self):
+        return json.loads(self.properties[OFFSETS_PROPERTY])
+
+    @property
+    def topic_id(self):
+        return self.properties.get(SINK.topic_id_property)
 
     def refresh(self):
         pass
@@ -36,11 +45,10 @@ class FakeTable:
         return SCHEMA
 
     def current_snapshot(self):
-        if self.offsets is None:
+        if self.properties is None:
             return None
-        props = {OFFSETS_PROPERTY: json.dumps(self.offsets)}
         return SimpleNamespace(snapshot_id=len(self.appends), parent_snapshot_id=None,
-                               summary=SimpleNamespace(additional_properties=props))
+                               summary=SimpleNamespace(additional_properties=self.properties))
 
     def append(self, batch, snapshot_properties):
         if self.fail_append:
@@ -49,15 +57,23 @@ class FakeTable:
             self.conflicts -= 1
             raise CommitFailedException("Requirement failed: branch main has changed")
         self.appends.append(batch.to_pylist())
-        self.offsets = json.loads(snapshot_properties[OFFSETS_PROPERTY])
+        self.properties = snapshot_properties
 
 
 class FakeConsumer:
-    def __init__(self, commit_error=None, during_commit=None):
+    def __init__(self, commit_error=None, during_commit=None, log_ends=None):
         self.commit_error = commit_error
         self.during_commit = during_commit
+        # high watermark per partition of the topic as it is now
+        self.log_ends = {0: 1000, 1: 1000, 2: 1000} if log_ends is None else log_ends
         self.commits = []
         self.assigned = None
+
+    def list_topics(self, topic, timeout):
+        return SimpleNamespace(topics={topic: SimpleNamespace(partitions={p: None for p in self.log_ends})})
+
+    def get_watermark_offsets(self, tp, timeout):
+        return 0, self.log_ends[tp.partition]
 
     def commit(self, offsets, asynchronous):
         self.commits.append({tp.partition: tp.offset for tp in offsets})
@@ -72,12 +88,15 @@ class FakeConsumer:
         self.assigned = [(p.partition, p.offset) for p in partitions]
 
 
-def make_writer(table, consumer):
+def make_writer(table, consumer, topic_id=TOPIC_ID):
     w = LakehouseWriter.__new__(LakehouseWriter)  # skip __init__: no registry, catalog or broker
     w.sink = SINK
     w.metrics = SinkMetrics(SINK)
     w.table = table
     w.consumer = consumer
+    w.topic_id_lookup = lambda: topic_id
+    w.topic_id = topic_id
+    w.adopt_untagged = True
     w.rows = RowBuilder(SCHEMA)
     w.buffer = []
     w.pending_offsets = {}
@@ -110,6 +129,7 @@ def test_flush_stores_next_offsets_with_the_data():
     assert [r["transaction_id"] for r in table.appends[0]] == ["T-1-5", "T-1-6"]
     # partition 0 had no new rows and keeps its stored offset
     assert table.offsets == {"0": 10, "1": 7}
+    assert table.topic_id == TOPIC_ID
     assert consumer.commits == [{1: 7}]
     assert w.buffer == [] and w.pending_offsets == {}
 
@@ -194,16 +214,17 @@ def test_append_gives_up_after_repeated_conflicts_and_keeps_the_buffer():
     assert len(w.buffer) == 1
 
 
-def test_stored_offsets_come_from_the_newest_snapshot_that_has_them():
-    """a snapshot made by another tool may lack the property; walk back to its parent"""
+def test_stored_position_comes_from_the_newest_snapshot_that_has_it():
+    """a snapshot made by another tool may lack the properties; walk back to its parent"""
+    props = {OFFSETS_PROPERTY: '{"0": 42}', SINK.topic_id_property: TOPIC_ID}
     with_offsets = SimpleNamespace(snapshot_id=1, parent_snapshot_id=None,
-                                   summary=SimpleNamespace(additional_properties={OFFSETS_PROPERTY: '{"0": 42}'}))
+                                   summary=SimpleNamespace(additional_properties=props))
     without = SimpleNamespace(snapshot_id=2, parent_snapshot_id=1,
                               summary=SimpleNamespace(additional_properties={"operation": "overwrite"}))
     table = SimpleNamespace(current_snapshot=lambda: without,
                             snapshot_by_id=lambda sid: {1: with_offsets, 2: without}[sid])
 
-    assert stored_offsets(table, OFFSETS_PROPERTY) == {"0": 42}
+    assert stored_position(table, SINK) == KafkaPosition({"0": 42}, TOPIC_ID)
 
 
 def test_on_assign_seeks_to_the_offsets_stored_in_iceberg():
@@ -218,6 +239,59 @@ def test_on_assign_seeks_to_the_offsets_stored_in_iceberg():
     assert consumer.assigned[0] == (0, 248)
     assert consumer.assigned[2] == (2, 230)
     assert consumer.commits == [{0: 248, 2: 230}]
+
+
+def test_a_recreated_topic_is_read_from_the_beginning():
+    """Regression: the topic was recreated and restarted at offset 0, but the sink resumed
+    from the old topic's offsets and skipped the new topic's first messages."""
+    table = FakeTable(offsets={"0": 248, "1": 328, "2": 242}, topic_id="old-topic")
+    consumer = FakeConsumer(log_ends={0: 5, 1: 5, 2: 5})
+    w = make_writer(table, consumer, topic_id="new-topic")
+    changes = w.metrics.topic_changes._value.get()
+
+    w.on_assign(consumer, [TopicPartition(SINK.topic, p) for p in (0, 1, 2)])
+    buffer_message(w, 1, 0)
+    buffer_message(w, 1, 1)
+    w.flush()
+
+    assert consumer.assigned == [(0, OFFSET_BEGINNING), (1, OFFSET_BEGINNING), (2, OFFSET_BEGINNING)]
+    assert [r["kafka_offset"] for r in table.appends[0]] == [0, 1]
+    # the old topic's offsets are dropped, not merged
+    assert table.offsets == {"1": 2}
+    assert table.topic_id == "new-topic"
+    assert w.metrics.topic_changes._value.get() == changes + 1
+
+
+@pytest.mark.parametrize("log_ends", [
+    {0: 0, 1: 0, 2: 0},       # a stored offset is past the end of its partition
+    {0: 1000, 1: 1000},       # a stored partition no longer exists
+])
+def test_offsets_stored_before_topic_ids_that_cannot_fit_the_topic_are_dropped(log_ends):
+    """the state of a stack upgraded after its topic was recreated"""
+    table = FakeTable(offsets={"0": 248, "1": 328, "2": 242}, topic_id=None)
+    consumer = FakeConsumer(log_ends=log_ends)
+    w = make_writer(table, consumer)
+    partitions = [TopicPartition(SINK.topic, p) for p in log_ends]
+
+    w.on_assign(consumer, partitions)
+
+    assert {offset for _, offset in consumer.assigned} == {OFFSET_BEGINNING}
+    assert w.stored_offsets() == {}
+
+
+def test_offsets_stored_before_topic_ids_are_adopted_when_they_fit():
+    table = FakeTable(offsets={"0": 248, "2": 242}, topic_id=None)
+    consumer = FakeConsumer(log_ends={0: 300, 1: 300, 2: 242})
+    w = make_writer(table, consumer)
+
+    w.on_assign(consumer, [TopicPartition(SINK.topic, p) for p in (0, 1, 2)])
+    buffer_message(w, 2, 242)
+    w.flush()
+
+    assert consumer.assigned == [(0, 248), (1, -1001), (2, 242)]
+    # the first commit records the topic id
+    assert table.offsets == {"0": 248, "2": 243}
+    assert table.topic_id == TOPIC_ID
 
 
 def test_env_overrides_the_sink_batch_size(monkeypatch):

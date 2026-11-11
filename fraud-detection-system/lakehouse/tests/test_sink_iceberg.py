@@ -9,7 +9,7 @@ from dataplatform import Encoder, subject_for
 from dataplatform.testing import registry_with
 from pyiceberg.catalog.sql import SqlCatalog
 
-from catalog import stored_offsets
+from catalog import stored_position
 from conftest import LAKEHOUSE, FakeMessage, FakeProducer, contract, contract_json
 from maintenance import compact
 from sink_config import load_sink
@@ -23,6 +23,9 @@ class RecordingConsumer:
     def __init__(self):
         self.commits = []
         self.assigned = None
+
+    def list_topics(self, topic, timeout):
+        raise AssertionError("only needed for offsets stored without a topic id")
 
     def commit(self, offsets, asynchronous):
         self.commits.append({tp.partition: tp.offset for tp in offsets})
@@ -51,8 +54,19 @@ def registry():
     return registry_with({"cdr-events": contract("cdr-events"), "fraud-decisions": contract("fraud-decisions")})
 
 
-def make_writer(sink, registry, catalog):
-    return LakehouseWriter(sink, registry, catalog, RecordingConsumer(), FakeProducer())
+TOPIC_ID = "topic-A"
+
+
+def make_writer(sink, registry, catalog, topic_id=TOPIC_ID):
+    w = LakehouseWriter(sink, registry, catalog, RecordingConsumer(), FakeProducer(), lambda: topic_id)
+    w.on_assign(w.consumer, [TopicPartition(sink.topic, p) for p in (0, 1, 2)])
+    return w
+
+
+def stored_offsets(table, sink):
+    position = stored_position(table, sink)
+    assert position.topic_id == TOPIC_ID
+    return position.offsets
 
 
 def rows(catalog, sink):
@@ -73,8 +87,8 @@ def test_contract_defines_the_table_and_messages_land_exactly_once(registry, cat
     assert str(table.spec().fields[0].transform) == "day" and table.spec().fields[0].name == "event_day"
     assert [r["transaction_id"] for r in rows(catalog, CDR_SINK)] == ["TXN-0", "TXN-1", "TXN-2"]
     assert rows(catalog, CDR_SINK)[0]["time_stamp"] == datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
-    assert stored_offsets(table, CDR_SINK.offsets_property) == {"0": 3}
-    assert w.consumer.commits == [{0: 3}]
+    assert stored_offsets(table, CDR_SINK) == {"0": 3}
+    assert w.consumer.commits[-1] == {0: 3}
 
 
 def test_a_new_contract_version_adds_its_fields_as_columns(registry, catalog):
@@ -124,7 +138,7 @@ def test_messages_that_cannot_be_written_go_to_the_dead_letter_topic(registry, c
     assert [m["headers"]["source_offset"] for m in dead] == ["0", "1"]
     assert dead[0]["headers"]["source"] == "lakehouse-writer/cdr_events"
     assert [r["transaction_id"] for r in rows(catalog, CDR_SINK)] == ["TXN-2"]
-    assert stored_offsets(catalog.load_table(CDR_SINK.table), CDR_SINK.offsets_property) == {"0": 3}
+    assert stored_offsets(catalog.load_table(CDR_SINK.table), CDR_SINK) == {"0": 3}
 
 
 def test_a_restarted_writer_resumes_after_the_rows_in_iceberg(registry, catalog):
@@ -135,9 +149,12 @@ def test_a_restarted_writer_resumes_after_the_rows_in_iceberg(registry, catalog)
     first.flush()
 
     restarted = make_writer(CDR_SINK, registry, catalog)
-    restarted.on_assign(restarted.consumer, [TopicPartition("cdr-events", p) for p in (0, 1, 2)])
 
     assert restarted.consumer.assigned == [(0, 2), (1, -1001), (2, 8)]
+
+    recreated = make_writer(CDR_SINK, registry, catalog, topic_id="topic-B")
+
+    assert {offset for _, offset in recreated.consumer.assigned} == {-2}  # OFFSET_BEGINNING
 
 
 def test_a_second_sink_needs_only_its_contract_and_sink_file(registry, catalog):
@@ -155,7 +172,7 @@ def test_a_second_sink_needs_only_its_contract_and_sink_file(registry, catalog):
     table = catalog.load_table("telecom.fraud_decisions")
     assert table.spec().fields[0].name == "event_day"
     assert rows(catalog, DECISIONS_SINK)[0]["method"] == "rules"
-    assert stored_offsets(table, "kafka.fraud-decisions.offsets") == {"0": 1}
+    assert stored_offsets(table, DECISIONS_SINK) == {"0": 1}
 
 
 def test_compaction_follows_the_sink_policy_and_keeps_offsets(registry, catalog):
@@ -172,4 +189,4 @@ def test_compaction_follows_the_sink_policy_and_keeps_offsets(registry, catalog)
     assert len(table.inspect.files()) == 1
     timestamps = table.scan().to_arrow()["time_stamp"].to_pylist()
     assert len(timestamps) == 6 and timestamps == sorted(timestamps)  # sorted by the sink's sort_by
-    assert stored_offsets(table, CDR_SINK.offsets_property) == {"0": 6}
+    assert stored_offsets(table, CDR_SINK) == {"0": 6}

@@ -129,6 +129,10 @@ A later test found a gap anyway. With the broker stopped, the writer appended a 
 
 Repeating the same broker outage after the fix: the commit failure was logged, the partitions were revoked and reassigned, the writer did not restart, and no new duplicates were written.
 
+**Offsets name their topic.** Offsets only mean something for the topic they were read from. When the local stack's `cdr-events` was deleted and created again, it restarted at offset 0, but the table still held offsets 248, 328 and 242 from the old topic: the writer would have resumed there and silently skipped the new topic's first messages. Each commit now also stores the topic's id (`kafka.<topic>.topic-id`; Kafka gives every topic a unique id when it is created, KIP-516), and compaction carries it forward. On every partition assignment the writer compares it with the live topic's id. If they differ, the stored offsets belong to a topic that no longer exists: the writer reads the new topic from its beginning, without falling back on the consumer group's equally stale committed offsets, logs an error and counts it for the `LakehouseSourceTopicRecreated` alert. Its next commit replaces the old offsets rather than merging with them.
+
+Snapshots written before ids were recorded have offsets without one. For those, an offset past the end of its partition, or a partition that no longer exists, proves the topic was recreated; otherwise the writer adopts the topic and records its id with the next commit. The one case this cannot catch is a topic recreated *and* refilled past the old offsets before the upgrade.
+
 ### Data contracts in a schema registry
 
 The first version sent JSON, and producers and consumers agreed on its fields informally. A renamed field or a changed type would only have shown up as messages in a dead-letter topic, after it had already broken the consumers. On a platform that several teams build on, the format of a topic is an interface and needs the same care as an API.
@@ -242,6 +246,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | A malformed message | Sent to `cdr-events-dlq` with the error; processing continues. Tested with a non-JSON message. |
 | `lakehouse-writer` crashes mid-batch | Unflushed rows were never committed to Iceberg, so on restart it reads them again from the last stored offsets. No loss, no duplicates. |
 | Kafka offsets lost or rewound | The writer ignores them and resumes from Iceberg. Tested by resetting the group to offset 0. |
+| A topic is deleted and created again | Its id changes, so the sink reads it from the beginning instead of resuming at the old topic's offsets, and `LakehouseSourceTopicRecreated` fires. Tested on the local stack, whose topic had been recreated; see [Exactly-once into Iceberg](#exactly-once-into-iceberg). |
 | Ollama unavailable | Uncertain cases fall back to the random forest score. After one failure the LLM is skipped for 30 seconds (circuit breaker), so the partition is not held up waiting for the same failure on every CDR. Tested under load; see [Performance](#performance). |
 | Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
 | A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
@@ -299,6 +304,7 @@ Alert rules ([`alerts.yml`](../fraud-detection-system/monitoring/prometheus/aler
 | `IngestPublishFailures` | Ingestion cannot publish to Kafka (clients get 503s) |
 | `LakehouseWriterNotCommitting` | A sink has messages to write but no commit for 5 minutes |
 | `LakehouseCommitConflicts` | More than 10 append retries in 15 minutes |
+| `LakehouseSourceTopicRecreated` | A sink found offsets from an earlier topic of the same name and started the new one from the beginning |
 | `LLMUnavailable` | The circuit breaker has been skipping the LLM for 10 minutes |
 | `LakehouseSmallFiles` | Over 1,000 files averaging under 1 MB for 30 minutes |
 | `LakehouseMaintenanceFailing`, `LakehouseMaintenanceNotRunning` | A task failed, or has not succeeded for 3 hours |
@@ -349,11 +355,10 @@ Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like t
 - **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
 - **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
 - **One writer per sink.** The offset merge assumes a single writer per table. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
-- **Stored offsets do not identify the topic.** If a topic is deleted and recreated, its offsets start again at 0, but the sink still resumes from the offsets stored in Iceberg and skips the new messages until it passes them. Storing the topic's id (Kafka topic ids, KIP-516) with the offsets would let the sink detect a new topic and start from its beginning.
 - **Flat contracts only.** Sinks reject nested records, arrays and maps. Iceberg supports them; mapping them is future work.
 - **Compaction competes with the writer.** PyIceberg rejects a commit whenever anything else committed since it read the table, even an append to an unrelated partition. Under constant writes, compaction can retry several times (it lost three races in a row in testing) and could give up after five. Iceberg's Java implementation validates conflicts per file instead, so non-overlapping appends do not block a rewrite; Spark's `rewrite_data_files` would avoid this.
 - **Compaction holds a range in memory.** Each commit reads up to 50 day partitions into memory before rewriting them. Fine at this scale; larger tables need smaller ranges or a distributed engine.
-- **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication.
+- **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication. SQLite allows one writer at a time, and the fixture does not wait for its lock. When the stack was upgraded to two sinks plus maintenance, their concurrent commits failed with `SQLITE_BUSY`, and the lock stayed held until the catalog was restarted. The sinks lost nothing (a failed commit leaves the offsets in Iceberg unchanged, so they re-read the batch), but they could not write either. A catalog backed by Postgres removes this.
 - **One registry, no authentication.** Anyone who can reach the registry can register a schema or change a compatibility level. The contracts job is the intended path, but nothing enforces it.
 - **DuckDB loads the snapshot into memory.** Fine for this data volume, not for large tables.
 

@@ -52,6 +52,13 @@ groups:
         annotations:
           summary: "Appends to {{ $labels.table }} keep conflicting with other commits"
 
+      - alert: LakehouseSourceTopicRecreated
+        expr: increase(lakehouse_topic_changes_total[1h]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "The topic behind {{ $labels.table }} was recreated; the sink restarted it from the beginning"
+
       - alert: LLMUnavailable
         expr: sum(rate(llm_skipped_total[5m])) > 0
         for: 10m

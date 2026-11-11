@@ -15,6 +15,11 @@ properties in the same commit as the data. On startup and on every partition ass
 the writer seeks to the offsets stored in the latest snapshot, so a crash between the
 Iceberg commit and the Kafka offset commit cannot produce duplicate rows.
 
+The offsets are stored with the topic's id. A topic that is deleted and created again
+gets a new id and starts again at offset 0; the stored offsets then belong to the old
+topic, and the writer reads the new one from its beginning instead of skipping its
+first messages.
+
 Schema evolution: messages carry the id of the contract version they were written with.
 When one arrives with a version the writer has not seen, its new fields are added to the
 table as columns before the message is buffered.
@@ -27,16 +32,25 @@ import os
 import signal
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import pyarrow as pa
-from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
+from confluent_kafka import (
+    OFFSET_BEGINNING,
+    Consumer,
+    KafkaError,
+    KafkaException,
+    Producer,
+    TopicCollection,
+    TopicPartition,
+)
+from confluent_kafka.admin import AdminClient
 from dataplatform import Decoder, registry_client, subject_for
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.table import Table
 
-from catalog import ensure_bucket, load_iceberg_catalog, stored_offsets
+from catalog import KafkaPosition, ensure_bucket, load_iceberg_catalog, stored_position
 from sink_config import SinkConfig, SinkConfigError, load_sink
 from table_schema import RowBuilder, describe_spec, iceberg_schema, partition_spec, sync_table_schema
 
@@ -63,6 +77,8 @@ kafka_commit_failures = Counter("lakehouse_kafka_commit_failures_total",
 dlq_messages = Counter("lakehouse_dlq_messages_total", "Messages the writer sent to the dead-letter topic", ["table"])
 schema_changes = Counter("lakehouse_schema_changes_total", "Columns added or widened from a new contract version",
                          ["table"])
+topic_changes = Counter("lakehouse_topic_changes_total",
+                        "Times the stored offsets belonged to an earlier topic with the same name", ["table"])
 buffered_rows = Gauge("lakehouse_buffered_rows", "Rows read from Kafka but not yet in Iceberg", ["table"])
 # consumergroup and topic match kafka-exporter's labels, so alerts can join on consumer lag
 last_commit = Gauge("lakehouse_last_commit_timestamp_seconds",
@@ -80,6 +96,7 @@ class SinkMetrics:
         self.kafka_commit_failures = kafka_commit_failures.labels(sink.table)
         self.dlq_messages = dlq_messages.labels(sink.table)
         self.schema_changes = schema_changes.labels(sink.table)
+        self.topic_changes = topic_changes.labels(sink.table)
         self.buffered_rows = buffered_rows.labels(sink.table)
         self.last_commit = last_commit.labels(sink.table, sink.consumer_group, sink.topic)
 
@@ -105,6 +122,28 @@ def latest_contract(registry, topic: str) -> Tuple[int, Dict]:
             logger.warning(f"No contract for {topic} yet ({e}), retrying in 2s")
             time.sleep(2)
     raise RuntimeError(f"No contract is registered for {topic} (subject {subject})")
+
+
+def kafka_topic_id(admin: AdminClient, topic: str) -> str:
+    """the id Kafka gave the topic when it was created (KIP-516); a recreated topic gets a new one"""
+    description = admin.describe_topics(TopicCollection([topic]))[topic].result(timeout=10)
+    return str(description.topic_id)
+
+
+def offsets_beyond_log(consumer, topic: str, offsets: Dict[str, int]) -> bool:
+    """True if a stored offset cannot belong to the topic as it is now.
+
+    Used for snapshots written before topic ids were recorded: a partition that no longer
+    exists, or an offset past the end of its partition, means the topic was recreated.
+    """
+    existing = consumer.list_topics(topic, timeout=10).topics[topic].partitions
+    for partition, offset in offsets.items():
+        if int(partition) not in existing:
+            return True
+        _, high = consumer.get_watermark_offsets(TopicPartition(topic, int(partition)), timeout=10)
+        if offset > high:
+            return True
+    return False
 
 
 def with_commit_retries(table: Table, action, on_conflict=None):
@@ -143,7 +182,8 @@ def prepare_table(catalog, sink: SinkConfig, avro_schema: Dict) -> Table:
 
 
 class LakehouseWriter:
-    def __init__(self, sink: SinkConfig, registry, catalog, consumer, dlq_producer):
+    def __init__(self, sink: SinkConfig, registry, catalog, consumer, dlq_producer,
+                 topic_id_lookup: Callable[[], str]):
         self.sink = sink
         self.metrics = SinkMetrics(sink)
         # JSON is accepted for messages from before the topic had a contract
@@ -159,6 +199,11 @@ class LakehouseWriter:
         self.running = True
         self.consumer = consumer
         self.dlq_producer = dlq_producer
+        self.topic_id_lookup = topic_id_lookup
+        # the id of the topic being read, set on every partition assignment
+        self.topic_id = None
+        # whether offsets stored without a topic id belong to the current topic
+        self.adopt_untagged = True
         # "last commit" starts now, so an alert fires if the first commit never comes
         self.metrics.last_commit.set_to_current_time()
 
@@ -174,19 +219,44 @@ class LakehouseWriter:
             "enable.auto.commit": False,
         })
         dlq_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS, "acks": "all"})
-        return cls(sink, registry_client(), load_iceberg_catalog(), consumer, dlq_producer)
+        admin = AdminClient({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS})
+        return cls(sink, registry_client(), load_iceberg_catalog(), consumer, dlq_producer,
+                   lambda: kafka_topic_id(admin, sink.topic))
+
+    def stored_position(self) -> KafkaPosition:
+        """the position saved with the data in the latest Iceberg snapshot"""
+        self.table.refresh()
+        return stored_position(self.table, self.sink)
+
+    def belongs_to_topic(self, position: KafkaPosition) -> bool:
+        if position.topic_id is None:
+            return self.adopt_untagged
+        return position.topic_id == self.topic_id
 
     def stored_offsets(self) -> Dict[str, int]:
-        """offsets saved with the data in the latest Iceberg snapshot"""
-        self.table.refresh()
-        return stored_offsets(self.table, self.sink.offsets_property)
+        """offsets saved in Iceberg for the current topic; none if they belong to an earlier one"""
+        position = self.stored_position()
+        return position.offsets if self.belongs_to_topic(position) else {}
 
     def on_assign(self, consumer, partitions):
         """start each partition right after the last row already in Iceberg"""
-        stored = self.stored_offsets()
-        for p in partitions:
-            if str(p.partition) in stored:
-                p.offset = stored[str(p.partition)]
+        self.topic_id = self.topic_id_lookup()
+        position = self.stored_position()
+        if position.offsets and position.topic_id is None:
+            self.adopt_untagged = not offsets_beyond_log(consumer, self.sink.topic, position.offsets)
+
+        if self.belongs_to_topic(position):
+            for p in partitions:
+                if str(p.partition) in position.offsets:
+                    p.offset = position.offsets[str(p.partition)]
+        elif position.offsets:
+            # Kafka's committed offsets for the group may be stale too, so do not fall back on them
+            self.metrics.topic_changes.inc()
+            logger.error(f"{self.sink.table} holds offsets {position.offsets} of an earlier {self.sink.topic} "
+                         f"(topic id {position.topic_id or 'not recorded'}, now {self.topic_id}); "
+                         f"the topic was recreated, reading it from the beginning")
+            for p in partitions:
+                p.offset = OFFSET_BEGINNING
         logger.info(f"Assigned partitions: {[(p.partition, p.offset) for p in partitions]}")
         consumer.assign(partitions)
         # bring Kafka's committed offsets in line with Iceberg, so consumer lag
@@ -297,7 +367,8 @@ class LakehouseWriter:
 
         started = time.monotonic()
         batch = pa.Table.from_pylist(rows, schema=self.table.schema().as_arrow())
-        self.table.append(batch, snapshot_properties={self.sink.offsets_property: json.dumps(offsets)})
+        position = KafkaPosition(offsets, self.topic_id)
+        self.table.append(batch, snapshot_properties=position.snapshot_properties(self.sink))
         elapsed = time.monotonic() - started
         self.metrics.commit_seconds.observe(elapsed)
         self.metrics.rows_appended.inc(len(rows))

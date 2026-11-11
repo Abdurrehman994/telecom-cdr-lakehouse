@@ -91,7 +91,7 @@ Then add a writer for it to `docker-compose.system.yml`, a copy of `lakehouse-wr
 ## What you get
 
 - An Iceberg table with a column per contract field, plus `kafka_partition`, `kafka_offset` and `ingested_at` for lineage.
-- Exactly-once delivery from the topic into the table, the same as `cdr_events`.
+- Exactly-once delivery from the topic into the table, the same as `cdr_events`. The stored offsets carry the topic's id, so recreating the topic does not make the sink skip data.
 - Schema evolution: register a new contract version with an extra optional field, and the sink adds the column when the first message with it arrives. Older rows read it as null.
 - Compaction, snapshot expiry and orphan cleanup with your policy.
 - Metrics labelled with your table, the table picker on the CDR Pipeline dashboard, and the lakehouse alerts.

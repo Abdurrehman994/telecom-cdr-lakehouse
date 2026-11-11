@@ -22,13 +22,13 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
 
 - **Data contracts.** Each topic's messages have an Avro schema in a schema registry, with `FULL_TRANSITIVE` compatibility. A breaking change is rejected when contracts are registered, and producers can only send with a registered schema. A shared client library (`libs/dataplatform`) does the encoding for every service.
 - **Config-driven lakehouse sinks.** A YAML file per sink names the topic, table, partitioning, batching and maintenance policy; the table's columns come from the contract. New optional contract fields become new columns automatically. A second dataset, fraud decisions, was onboarded with three files and no new code ([how](docs/onboarding-a-dataset.md)).
-- **Exactly-once into Iceberg.** Kafka offsets are stored in the same Iceberg snapshot as the data, so a crash or an offset reset never duplicates or loses rows.
+- **Exactly-once into Iceberg.** Kafka offsets and the topic's id are stored in the same Iceberg snapshot as the data, so a crash, an offset reset or a recreated topic never duplicates or loses rows.
 - **Idempotent fraud alerts.** Alerts are keyed by `transaction_id`, so replaying the topic creates no duplicate alerts or notifications.
 - **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
 - **Failure handling.** A dead-letter topic for bad messages, retries with backoff when Postgres is down, and consumer rebalancing when a replica stops. Each was tested.
 - **OLTP and OLAP side by side.** Postgres for alert case management, Iceberg and DuckDB for analytics and snapshot time travel.
 - **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup, safe to run while the writer commits. After a load test it turned 5,081 small files into 301.
-- **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 11 alert rules, and a provisioned Grafana dashboard.
+- **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard.
 - **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the test found and fixed two bottlenecks in fraud detection.
 
 For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md). To add a dataset, see [docs/onboarding-a-dataset.md](docs/onboarding-a-dataset.md).

@@ -38,7 +38,7 @@ from pyiceberg.expressions import And, GreaterThanOrEqual, LessThan
 from pyiceberg.table import Table
 from pyiceberg.types import DateType
 
-from catalog import load_iceberg_catalog, s3_filesystem, stored_offsets
+from catalog import load_iceberg_catalog, s3_filesystem, stored_position
 from sink_config import SinkConfig, load_sinks
 
 logging.basicConfig(
@@ -173,10 +173,11 @@ def compact_range(catalog, sink: SinkConfig, first_day: int, last_day: int) -> T
     if data.num_rows != expected_rows:
         raise RuntimeError(f"read {data.num_rows} rows but the files hold {expected_rows}; not compacting")
 
-    offsets = stored_offsets(table, sink.offsets_property)
+    # carry the writer's position (offsets and topic id) forward
+    position = stored_position(table, sink)
     properties = {"lakehouse.maintenance": "compaction"}
-    if offsets:
-        properties[sink.offsets_property] = json.dumps(offsets)
+    if position.offsets:
+        properties.update(position.snapshot_properties(sink))
     # Delete the range's files and add the rewritten rows in one commit. The filter
     # covers whole days, so whole files are dropped. (dynamic_partition_overwrite would
     # be simpler, but PyIceberg only supports it for identity partitions.)
