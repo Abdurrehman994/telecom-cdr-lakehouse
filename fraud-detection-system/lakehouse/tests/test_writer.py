@@ -1,18 +1,23 @@
 """Exactly-once behaviour of the lakehouse writer, with Iceberg and Kafka faked."""
 import json
-import sys
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from confluent_kafka import KafkaError, KafkaException, TopicPartition
 from pyiceberg.exceptions import CommitFailedException
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import writer  # noqa: E402
-from writer import CDR_SCHEMA, KAFKA_TOPIC, OFFSETS_PROPERTY, LakehouseWriter, to_row  # noqa: E402
+import writer
+from catalog import stored_offsets
+from conftest import LAKEHOUSE, contract_json
+from sink_config import load_sink
+from table_schema import RowBuilder, iceberg_schema
+from writer import LakehouseWriter, SinkMetrics
+
+SINK = load_sink(str(LAKEHOUSE / "sinks" / "cdr_events.yaml"))
+OFFSETS_PROPERTY = SINK.offsets_property
+SCHEMA = iceberg_schema(contract_json("cdr-events"))
 
 
 class FakeTable:
@@ -26,6 +31,9 @@ class FakeTable:
 
     def refresh(self):
         pass
+
+    def schema(self):
+        return SCHEMA
 
     def current_snapshot(self):
         if self.offsets is None:
@@ -65,10 +73,12 @@ class FakeConsumer:
 
 
 def make_writer(table, consumer):
-    w = LakehouseWriter.__new__(LakehouseWriter)  # skip __init__: no S3, catalog or broker
+    w = LakehouseWriter.__new__(LakehouseWriter)  # skip __init__: no registry, catalog or broker
+    w.sink = SINK
+    w.metrics = SinkMetrics(SINK)
     w.table = table
     w.consumer = consumer
-    w.arrow_schema = CDR_SCHEMA.as_arrow()
+    w.rows = RowBuilder(SCHEMA)
     w.buffer = []
     w.pending_offsets = {}
     w.last_flush = time.monotonic()
@@ -77,10 +87,10 @@ def make_writer(table, consumer):
 
 
 def buffer_message(w, partition, offset):
-    """what run() does for each message it reads"""
+    """what buffer_message() does for each decoded message"""
     cdr = {"transaction_id": f"T-{partition}-{offset}", "customer_id": "CUST-1",
            "amount_eur": 10, "time_stamp": "2026-01-01T12:00:00Z"}
-    w.buffer.append(to_row(cdr, partition, offset))
+    w.buffer.append(w.rows.build(cdr, partition, offset, datetime.now(timezone.utc)))
     w.pending_offsets[partition] = offset + 1
 
 
@@ -193,14 +203,14 @@ def test_stored_offsets_come_from_the_newest_snapshot_that_has_them():
     table = SimpleNamespace(current_snapshot=lambda: without,
                             snapshot_by_id=lambda sid: {1: with_offsets, 2: without}[sid])
 
-    assert writer.stored_offsets(table) == {"0": 42}
+    assert stored_offsets(table, OFFSETS_PROPERTY) == {"0": 42}
 
 
 def test_on_assign_seeks_to_the_offsets_stored_in_iceberg():
     table = FakeTable(offsets={"0": 248, "2": 230})
     consumer = FakeConsumer(commit_error=unknown_member())
     w = make_writer(table, consumer)
-    partitions = [TopicPartition(KAFKA_TOPIC, p) for p in (0, 1, 2)]
+    partitions = [TopicPartition(SINK.topic, p) for p in (0, 1, 2)]
 
     w.on_assign(consumer, partitions)  # a failing lag commit must not stop the assignment
 
@@ -210,11 +220,11 @@ def test_on_assign_seeks_to_the_offsets_stored_in_iceberg():
     assert consumer.commits == [{0: 248, 2: 230}]
 
 
-def test_to_row_parses_timestamps_and_records_lineage():
-    row = to_row({"transaction_id": "T1", "amount_eur": "12.5", "risk_score": 1,
-                  "time_stamp": "2026-03-01T08:00:00"}, partition=2, offset=41)
+def test_env_overrides_the_sink_batch_size(monkeypatch):
+    monkeypatch.setenv("FLUSH_MAX_RECORDS", "5000")
+    monkeypatch.setenv("FLUSH_INTERVAL_SECONDS", "")
 
-    assert row["time_stamp"] == datetime(2026, 3, 1, 8, tzinfo=timezone.utc)
-    assert row["amount_eur"] == 12.5 and row["risk_score"] == 1.0
-    assert (row["kafka_partition"], row["kafka_offset"]) == (2, 41)
-    assert writer.parse_timestamp(None) is None
+    sink = writer.with_env_overrides(SINK)
+
+    assert sink.flush_max_records == 5000
+    assert sink.flush_interval_seconds == SINK.flush_interval_seconds

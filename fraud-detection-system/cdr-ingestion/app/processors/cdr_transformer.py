@@ -1,5 +1,5 @@
 """CDR transformation and enrichment logic"""
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Any
 from app.schemas import CDRRecord
 
@@ -13,7 +13,7 @@ def calculate_fraud_probability(risk_score: float, amount: float) -> bool:
 def enrich_cdr(record: CDRRecord) -> Dict[str, Any]:
     """Enrich CDR record with additional data"""
     enriched = record.model_dump(exclude_none=True)
-    enriched["processed_timestamp"] = datetime.utcnow().isoformat()
+    enriched["processed_timestamp"] = datetime.now(timezone.utc)
     
     # Auto-flag fraud if certain conditions are met
     if not enriched.get("fraud_flag"):

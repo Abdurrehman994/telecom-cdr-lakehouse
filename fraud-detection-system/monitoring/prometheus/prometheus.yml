@@ -31,9 +31,10 @@ scrape_configs:
     static_configs:
       - targets: ['ml-service:8001', 'ml-service2:8001']
 
+  # one writer per lakehouse sink; metrics carry a table label
   - job_name: 'lakehouse-writer'
     static_configs:
-      - targets: ['lakehouse-writer:8002']
+      - targets: ['lakehouse-writer:8002', 'lakehouse-writer-fraud-decisions:8002']
 
   - job_name: 'lakehouse-maintenance'
     static_configs:

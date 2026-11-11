@@ -1,10 +1,7 @@
 """Selection rules of the table maintenance jobs."""
-import sys
 from datetime import date, datetime, timedelta, timezone
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from maintenance import (  # noqa: E402
+from maintenance import (
     chunks,
     compaction_ranges,
     day_number,
@@ -23,19 +20,19 @@ def data_file(day, content=0):
 def test_only_partitions_with_enough_files_are_compacted():
     files = [data_file(100)] * 5 + [data_file(101)] * 4 + [data_file(102)] * 9
 
-    assert partitions_to_compact(files, min_files=5) == [100, 102]
+    assert partitions_to_compact(files, min_files=5, partition="event_day") == [100, 102]
 
 
 def test_compaction_ignores_delete_files_and_unpartitioned_rows():
     files = [data_file(100, content=1)] * 6 + [data_file(None)] * 6
 
-    assert partitions_to_compact(files, min_files=5) == []
+    assert partitions_to_compact(files, min_files=5, partition="event_day") == []
 
 
 def test_day_partitions_are_read_as_ints_or_dates():
     assert day_number(date(1970, 1, 11)) == 10
     assert day_number(10) == 10
-    assert partitions_to_compact([data_file(date(2026, 1, 1))] * 5, min_files=5) == [20454]
+    assert partitions_to_compact([data_file(date(2026, 1, 1))] * 5, min_files=5, partition="event_day") == [20454]
 
 
 def test_partitions_are_compacted_in_bounded_groups():
@@ -48,10 +45,17 @@ def test_each_commit_covers_one_contiguous_range_of_days():
 
 
 def test_range_filter_covers_whole_utc_days():
-    expr = range_filter(20454, 20455)  # 2026-01-01 .. 2026-01-02
+    expr = range_filter("time_stamp", 20454, 20455)  # 2026-01-01 .. 2026-01-02
 
+    assert "time_stamp" in repr(expr)
     assert "2026-01-01T00:00:00+00:00" in repr(expr)
     assert "2026-01-03T00:00:00+00:00" in repr(expr)
+
+
+def test_range_filter_on_a_date_column_uses_dates():
+    expr = range_filter("day", 20454, 20454, is_date=True)
+
+    assert "2026-01-01" in repr(expr) and "2026-01-02" in repr(expr) and "T00" not in repr(expr)
 
 
 def test_newest_snapshots_and_the_current_one_are_never_expired():

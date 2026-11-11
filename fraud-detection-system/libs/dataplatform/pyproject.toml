@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataplatform"
+version = "0.1.0"
+description = "Client library for the data platform: Avro data contracts through the schema registry"
+requires-python = ">=3.11"
+dependencies = [
+    "confluent-kafka[schemaregistry]>=2.6,<3",
+    "fastavro>=1.9,<2",
+    "PyYAML>=6,<7",
+]
+
+[tool.setuptools]
+packages = ["dataplatform"]

@@ -4,6 +4,7 @@ import threading
 import time
 import numpy as np
 from collections import deque
+from datetime import datetime, timezone
 from typing import Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from fastapi.responses import Response
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
+from dataplatform import ContractViolation, Decoder, Encoder, InvalidMessage, registry_client
 import psycopg
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool, PoolTimeout
@@ -23,6 +25,7 @@ llm_latency = Histogram('llm_analysis_duration_seconds', 'LLM analysis time')
 cdr_processed = Counter('cdr_processed_total', 'Total CDRs processed', ['status'])
 llm_skipped = Counter('llm_skipped_total', 'Uncertain CDRs scored without the LLM because it recently failed')
 duplicate_alerts_skipped = Counter('duplicate_alerts_skipped_total', 'Redelivered CDRs whose alert was already stored')
+decisions_published = Counter('fraud_decisions_published_total', 'Decisions published to the fraud-decisions topic')
 
 # FastAPI app
 app = FastAPI(title="ML Fraud Detection Service")
@@ -83,7 +86,7 @@ class FraudDetectionEngine:
             }
         
         if fraud_score < 0.3:
-            return {'is_fraud': False, 'confidence': 1 - fraud_score}
+            return {'is_fraud': False, 'confidence': 1 - fraud_score, 'method': 'random_forest'}
         
         # stage 3: LLM validation for uncertain cases
         llm_result = self.llm_validate(cdr, fraud_score)
@@ -404,6 +407,41 @@ class AlertStore:
 
 alert_store = AlertStore()
 
+def as_json_values(cdr: Dict) -> Dict:
+    """a decoded CDR in the shape the detector expects: the JSON cdr-ingestion used to send.
+
+    that JSON left out empty fields and carried timestamps as ISO strings.
+    """
+    return {k: v.isoformat() if isinstance(v, datetime) else v for k, v in cdr.items() if v is not None}
+
+
+def parse_time(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value)
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def decision_event(cdr: Dict, result: Dict, partition: int, offset: int, detector_id: str) -> Dict:
+    """the fraud-decisions message for one CDR (contract: contracts/fraud-decisions-value.avsc)"""
+    confidence = result.get('confidence')
+    return {
+        'transaction_id': cdr['transaction_id'],
+        'customer_id': cdr['customer_id'],
+        # truthy, like the check that decides whether to alert
+        'is_fraud': bool(result.get('is_fraud')),
+        'method': result.get('method', 'unknown'),
+        'fraud_type': str(result['fraud_type']) if result.get('fraud_type') is not None else None,
+        # the LLM's answer is free text, so its confidence may not be a number
+        'confidence': float(confidence) if isinstance(confidence, (int, float)) else None,
+        'explanation': str(result['explanation']) if result.get('explanation') is not None else None,
+        'amount_eur': float(cdr['amount_eur']),
+        'event_time': parse_time(cdr['time_stamp']),
+        'decided_at': datetime.now(timezone.utc),
+        'detector': detector_id,
+        'source_partition': partition,
+        'source_offset': offset,
+    }
+
+
 # kafka Consumer
 class CDRConsumer:
     """reads CDRs from a kafka topic as part of a consumer group.
@@ -412,20 +450,30 @@ class CDRConsumer:
     topic's partitions between them. offsets are stored only after a CDR is
     fully processed, which gives at-least-once delivery: a crash mid-message
     means that message is read again, never skipped.
+
+    each decision is published to the decisions topic before the offset is
+    stored, so decisions are at-least-once too; consumers deduplicate on
+    transaction_id.
     """
     def __init__(
             self,
             bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
             topic=os.getenv("KAFKA_TOPIC", "cdr-events"),
             group_id=os.getenv("KAFKA_GROUP_ID", "fraud-detection"),
-            dlq_topic=os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq")
+            dlq_topic=os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq"),
+            decisions_topic=os.getenv("KAFKA_DECISIONS_TOPIC", "fraud-decisions"),
             ):
         self.bootstrap_servers = bootstrap_servers
         self.topic = topic
         self.group_id = group_id
         self.dlq_topic = dlq_topic
+        self.decisions_topic = decisions_topic
+        self.client_id = os.getenv("HOSTNAME", "ml-service")
         self.consumer = None
         self.dlq_producer = None
+        self.decisions_producer = None
+        self.decoder = None
+        self.decision_encoder = None
         self.running = False
 
     def connect(self):
@@ -433,7 +481,7 @@ class CDRConsumer:
         self.consumer = Consumer({
             "bootstrap.servers": self.bootstrap_servers,
             "group.id": self.group_id,
-            "client.id": os.getenv("HOSTNAME", "ml-service"),
+            "client.id": self.client_id,
             # a brand new group starts from the oldest message, not just new ones
             "auto.offset.reset": "earliest",
             # commit in the background, but only offsets we stored ourselves
@@ -445,6 +493,18 @@ class CDRConsumer:
             "bootstrap.servers": self.bootstrap_servers,
             "acks": "all",
         })
+        self.decisions_producer = Producer({
+            "bootstrap.servers": self.bootstrap_servers,
+            "acks": "all",
+            "enable.idempotence": True,
+        })
+        registry = registry_client()
+        # JSON is accepted for CDRs from before cdr-events had a contract
+        self.decoder = Decoder(registry, allow_json=True)
+        self.decision_encoder = Encoder.from_file(
+            registry, self.decisions_topic,
+            os.getenv("DECISIONS_CONTRACT_PATH", "contracts/fraud-decisions-value.avsc"),
+        )
         self.consumer.subscribe(
             [self.topic],
             on_assign=lambda c, parts: print(f"assigned partitions: {[p.partition for p in parts]}"),
@@ -468,11 +528,59 @@ class CDRConsumer:
         self.dlq_producer.flush(10)
         print(f"sent message from partition {msg.partition()} offset {msg.offset()} to {self.dlq_topic}")
 
+    def retry_until_stopped(self, action, what: str):
+        """run action until it succeeds, backing off between attempts.
+
+        for outages that end (the schema registry, the broker), so the partition
+        waits instead of sending valid CDRs to the DLQ. returns (True, result),
+        or (False, None) if the consumer is stopping first.
+        """
+        delay = 1
+        while self.running:
+            try:
+                return True, action()
+            except (InvalidMessage, ContractViolation):
+                raise
+            except Exception as e:
+                print(f"{what} failed ({e}), retrying in {delay}s")
+                time.sleep(delay)
+                delay = min(delay * 2, 30)
+        return False, None
+
+    def decode(self, msg) -> Optional[Dict]:
+        """the CDR in msg; None if stopping during a registry outage. raises InvalidMessage for a bad message"""
+        ok, decoded = self.retry_until_stopped(lambda: self.decoder.decode(msg.value()), "decoding the CDR")
+        return as_json_values(decoded.value) if ok else None
+
+    def publish_decision(self, cdr: Dict, result: Dict, msg) -> bool:
+        """publish the decision and wait for the broker; False if stopping before it is stored"""
+        event = decision_event(cdr, result, msg.partition(), msg.offset(), self.client_id)
+
+        def deliver():
+            outcome = {}
+            self.decisions_producer.produce(
+                self.decisions_topic,
+                key=str(cdr['customer_id']).encode(),
+                value=self.decision_encoder.encode(event),
+                on_delivery=lambda err, _: outcome.setdefault('error', err),
+            )
+            self.decisions_producer.flush(10)
+            error = outcome.get('error', 'not confirmed in time')
+            if error is not None:
+                raise RuntimeError(f"broker did not store the decision: {error}")
+
+        ok, _ = self.retry_until_stopped(deliver, "publishing the decision")
+        if ok:
+            decisions_published.inc()
+        return ok
+
     def process_message(self, msg):
         """process one CDR from kafka"""
         try:
-            # parse CDR
-            cdr = json.loads(msg.value())
+            cdr = self.decode(msg)
+            if cdr is None:
+                # stopping: leave the offset unstored so this CDR is read again
+                return
             print(f"\nreceived CDR: {cdr.get('transaction_id', 'Unknown')}")
             
             # detect fraud
@@ -490,10 +598,12 @@ class CDRConsumer:
                     # stopping before the alert was stored: leave the offset
                     # unstored so this CDR is processed again after restart
                     return
-                cdr_processed.labels(status='fraud').inc()
             else:
                 print(f"clean transaction")
-                cdr_processed.labels(status='clean').inc()
+
+            if not self.publish_decision(cdr, result, msg):
+                return
+            cdr_processed.labels(status='fraud' if result['is_fraud'] else 'clean').inc()
 
         except Exception as e:
             print(f"error processing CDR: {e}")

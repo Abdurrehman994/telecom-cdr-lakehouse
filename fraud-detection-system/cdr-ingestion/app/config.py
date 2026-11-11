@@ -9,6 +9,9 @@ class Settings(BaseSettings):
     # Kafka Configuration
     kafka_bootstrap_servers: str = Field("kafka:9092", description="Kafka brokers from KAFKA_BOOTSTRAP_SERVERS env var")
     kafka_topic: str = Field("cdr-events", description="Kafka topic from KAFKA_TOPIC env var")
+    schema_registry_url: str = Field("http://schema-registry:8081", description="Schema registry from SCHEMA_REGISTRY_URL env var")
+    # the topic's data contract; it must also be registered, or publishing fails
+    cdr_contract_path: str = Field("contracts/cdr-events-value.avsc", description="Avro schema from CDR_CONTRACT_PATH env var")
 
     # PostgreSQL Configuration
     postgres_host: str = Field(..., description="PostgreSQL host from POSTGRES_HOST env var")

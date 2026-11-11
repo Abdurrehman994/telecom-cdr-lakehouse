@@ -1,0 +1,21 @@
+{
+  "type": "record",
+  "name": "FraudDecision",
+  "namespace": "telecom.fraud",
+  "doc": "The fraud detection decision for one CDR, fraudulent or not, published by ml-service. Key: customer_id. Delivery is at-least-once: deduplicate on transaction_id.",
+  "fields": [
+    {"name": "transaction_id", "type": "string"},
+    {"name": "customer_id", "type": "string"},
+    {"name": "is_fraud", "type": "boolean"},
+    {"name": "method", "type": "string", "doc": "rules, random_forest, llm, llm_error or scoring_fallback"},
+    {"name": "fraud_type", "type": ["null", "string"], "default": null},
+    {"name": "confidence", "type": ["null", "double"], "default": null},
+    {"name": "explanation", "type": ["null", "string"], "default": null},
+    {"name": "amount_eur", "type": "double"},
+    {"name": "event_time", "type": {"type": "long", "logicalType": "timestamp-micros"}, "doc": "time_stamp of the CDR (UTC)"},
+    {"name": "decided_at", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+    {"name": "detector", "type": "string", "doc": "ml-service replica that decided"},
+    {"name": "source_partition", "type": "int", "doc": "cdr-events partition of the CDR"},
+    {"name": "source_offset", "type": "long", "doc": "cdr-events offset of the CDR"}
+  ]
+}

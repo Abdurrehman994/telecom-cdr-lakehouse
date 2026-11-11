@@ -1,43 +1,44 @@
-"""Lakehouse writer: streams CDRs from Kafka into an Apache Iceberg table.
+"""Lakehouse sink: streams one Kafka topic into one Apache Iceberg table.
 
-Reads the cdr-events topic as its own consumer group, so it gets every CDR
-independently of fraud detection. CDRs are buffered and appended to Iceberg
-in batches, because each append creates a snapshot and new Parquet files;
-appending one row at a time would leave thousands of tiny files.
+What lands where is configuration, not code. A sink file in sinks/ names the topic, the
+table, its partitioning, batching and maintenance policy; the table's columns come from
+the topic's data contract in the schema registry. Run one writer per sink:
 
-Exactly-once: the Kafka offsets of each batch are written into the Iceberg
-snapshot properties in the same commit as the data. On startup and on every
-partition assignment the writer seeks to the offsets stored in the latest
-snapshot, so a crash between the Iceberg commit and the Kafka offset commit
-cannot produce duplicate rows.
+    python writer.py sinks/cdr_events.yaml
+
+Each sink reads its topic as its own consumer group, independently of other consumers.
+Messages are buffered and appended in batches, because each append creates a snapshot
+and new Parquet files; appending one row at a time would leave thousands of tiny files.
+
+Exactly-once: the Kafka offsets of each batch are written into the Iceberg snapshot
+properties in the same commit as the data. On startup and on every partition assignment
+the writer seeks to the offsets stored in the latest snapshot, so a crash between the
+Iceberg commit and the Kafka offset commit cannot produce duplicate rows.
+
+Schema evolution: messages carry the id of the contract version they were written with.
+When one arrives with a version the writer has not seen, its new fields are added to the
+table as columns before the message is buffered.
 """
+import argparse
+import dataclasses
 import json
 import logging
 import os
 import signal
 import time
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple
 
 import pyarrow as pa
-from pyarrow import fs
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
+from dataplatform import Decoder, registry_client, subject_for
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
-from pyiceberg.catalog import load_catalog
 from pyiceberg.exceptions import CommitFailedException
-from pyiceberg.partitioning import PartitionField, PartitionSpec
-from pyiceberg.schema import Schema
 from pyiceberg.table import Table
-from pyiceberg.transforms import DayTransform
-from pyiceberg.types import (
-    BooleanType,
-    DoubleType,
-    IntegerType,
-    LongType,
-    NestedField,
-    StringType,
-    TimestamptzType,
-)
+
+from catalog import ensure_bucket, load_iceberg_catalog, stored_offsets
+from sink_config import SinkConfig, SinkConfigError, load_sink
+from table_schema import RowBuilder, describe_spec, iceberg_schema, partition_spec, sync_table_schema
 
 logging.basicConfig(
     level=logging.INFO,
@@ -46,187 +47,139 @@ logging.basicConfig(
 logger = logging.getLogger("lakehouse-writer")
 
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
-KAFKA_TOPIC = os.getenv("KAFKA_TOPIC", "cdr-events")
-KAFKA_GROUP_ID = os.getenv("KAFKA_GROUP_ID", "lakehouse-writer")
-KAFKA_DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq")
-ICEBERG_TABLE = os.getenv("ICEBERG_TABLE", "telecom.cdr_events")
-FLUSH_MAX_RECORDS = int(os.getenv("FLUSH_MAX_RECORDS", "500"))
-FLUSH_INTERVAL_SECONDS = float(os.getenv("FLUSH_INTERVAL_SECONDS", "10"))
 # an append can lose a race with a maintenance commit; it is retried on the new snapshot
 COMMIT_ATTEMPTS = int(os.getenv("COMMIT_ATTEMPTS", "5"))
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8002"))
 
-rows_appended = Counter("lakehouse_rows_appended_total", "Rows appended to the Iceberg table")
-rows_skipped = Counter("lakehouse_rows_skipped_total", "Buffered rows skipped because Iceberg already had them")
-commit_seconds = Histogram("lakehouse_commit_duration_seconds", "Time to append one batch to Iceberg",
+rows_appended = Counter("lakehouse_rows_appended_total", "Rows appended to the Iceberg table", ["table"])
+rows_skipped = Counter("lakehouse_rows_skipped_total", "Buffered rows skipped because Iceberg already had them",
+                       ["table"])
+commit_seconds = Histogram("lakehouse_commit_duration_seconds", "Time to append one batch to Iceberg", ["table"],
                            buckets=(0.25, 0.5, 1, 2, 4, 8, 16, 32, 64))
-commit_conflicts = Counter("lakehouse_commit_conflicts_total", "Appends retried after a concurrent Iceberg commit")
-kafka_commit_failures = Counter("lakehouse_kafka_commit_failures_total", "Failed Kafka offset commits (lag reporting only)")
-dlq_messages = Counter("lakehouse_dlq_messages_total", "Messages the writer sent to the dead-letter topic")
-buffered_rows = Gauge("lakehouse_buffered_rows", "Rows read from Kafka but not yet in Iceberg")
-last_commit = Gauge("lakehouse_last_commit_timestamp_seconds", "Unix time of the last successful append")
-
-# snapshot property that holds the next Kafka offset to read, per partition
-OFFSETS_PROPERTY = f"kafka.{KAFKA_TOPIC}.offsets"
-
-CDR_SCHEMA = Schema(
-    NestedField(1, "transaction_id", StringType(), required=False),
-    NestedField(2, "customer_id", StringType(), required=False),
-    NestedField(3, "full_name", StringType(), required=False),
-    NestedField(4, "city", StringType(), required=False),
-    NestedField(5, "mobile_number", StringType(), required=False),
-    NestedField(6, "sim_serial_number", StringType(), required=False),
-    NestedField(7, "sim_status", StringType(), required=False),
-    NestedField(8, "imei", StringType(), required=False),
-    NestedField(9, "risk_score", DoubleType(), required=False),
-    NestedField(10, "fraud_flag", BooleanType(), required=False),
-    NestedField(11, "fraud_type", StringType(), required=False),
-    NestedField(12, "type", StringType(), required=False),
-    NestedField(13, "amount_eur", DoubleType(), required=False),
-    NestedField(14, "time_stamp", TimestamptzType(), required=False),
-    NestedField(15, "processed_timestamp", TimestamptzType(), required=False),
-    # lineage: where in Kafka each row came from
-    NestedField(16, "kafka_partition", IntegerType(), required=False),
-    NestedField(17, "kafka_offset", LongType(), required=False),
-    NestedField(18, "ingested_at", TimestamptzType(), required=False),
-)
-
-# one folder of files per day, so date-filtered queries skip other days
-CDR_PARTITION_SPEC = PartitionSpec(
-    PartitionField(source_id=14, field_id=1000, transform=DayTransform(), name="event_day")
-)
+commit_conflicts = Counter("lakehouse_commit_conflicts_total", "Appends retried after a concurrent Iceberg commit",
+                           ["table"])
+kafka_commit_failures = Counter("lakehouse_kafka_commit_failures_total",
+                                "Failed Kafka offset commits (lag reporting only)", ["table"])
+dlq_messages = Counter("lakehouse_dlq_messages_total", "Messages the writer sent to the dead-letter topic", ["table"])
+schema_changes = Counter("lakehouse_schema_changes_total", "Columns added or widened from a new contract version",
+                         ["table"])
+buffered_rows = Gauge("lakehouse_buffered_rows", "Rows read from Kafka but not yet in Iceberg", ["table"])
+# consumergroup and topic match kafka-exporter's labels, so alerts can join on consumer lag
+last_commit = Gauge("lakehouse_last_commit_timestamp_seconds",
+                    "Unix time of the last successful append (or of startup)", ["table", "consumergroup", "topic"])
 
 
-S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://seaweedfs:8333")
-S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID", "lakehouse")
-S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY", "lakehouse-secret")
-S3_REGION = os.getenv("S3_REGION", "us-east-1")
-S3_BUCKET = os.getenv("S3_BUCKET", "warehouse")
+class SinkMetrics:
+    """the writer metrics, labelled with this sink's table"""
+
+    def __init__(self, sink: SinkConfig):
+        self.rows_appended = rows_appended.labels(sink.table)
+        self.rows_skipped = rows_skipped.labels(sink.table)
+        self.commit_seconds = commit_seconds.labels(sink.table)
+        self.commit_conflicts = commit_conflicts.labels(sink.table)
+        self.kafka_commit_failures = kafka_commit_failures.labels(sink.table)
+        self.dlq_messages = dlq_messages.labels(sink.table)
+        self.schema_changes = schema_changes.labels(sink.table)
+        self.buffered_rows = buffered_rows.labels(sink.table)
+        self.last_commit = last_commit.labels(sink.table, sink.consumer_group, sink.topic)
 
 
-def ensure_bucket():
-    """create the warehouse bucket if it does not exist yet"""
-    s3 = fs.S3FileSystem(
-        endpoint_override=S3_ENDPOINT,
-        access_key=S3_ACCESS_KEY_ID,
-        secret_key=S3_SECRET_ACCESS_KEY,
-        region=S3_REGION,
-        allow_bucket_creation=True,
-    )
-    if s3.get_file_info(S3_BUCKET).type == fs.FileType.NotFound:
-        s3.create_dir(S3_BUCKET)
-        logger.info(f"Created bucket {S3_BUCKET}")
+def with_env_overrides(sink: SinkConfig) -> SinkConfig:
+    """FLUSH_MAX_RECORDS and FLUSH_INTERVAL_SECONDS override the sink file, e.g. for a load test"""
+    overrides = {}
+    if os.getenv("FLUSH_MAX_RECORDS"):
+        overrides["flush_max_records"] = int(os.environ["FLUSH_MAX_RECORDS"])
+    if os.getenv("FLUSH_INTERVAL_SECONDS"):
+        overrides["flush_interval_seconds"] = float(os.environ["FLUSH_INTERVAL_SECONDS"])
+    return dataclasses.replace(sink, **overrides)
 
 
-def load_iceberg_catalog():
-    """connect to the Iceberg REST catalog, retrying until it is up"""
-    for attempt in range(30):
+def latest_contract(registry, topic: str) -> Tuple[int, Dict]:
+    """(schema id, Avro schema) of the newest contract version for the topic, retrying until it is registered"""
+    subject = subject_for(topic)
+    for _ in range(30):
         try:
-            catalog = load_catalog(
-                "lakehouse",
-                **{
-                    "type": "rest",
-                    "uri": os.getenv("ICEBERG_CATALOG_URI", "http://iceberg-rest:8181"),
-                    "s3.endpoint": S3_ENDPOINT,
-                    "s3.access-key-id": S3_ACCESS_KEY_ID,
-                    "s3.secret-access-key": S3_SECRET_ACCESS_KEY,
-                    "s3.region": S3_REGION,
-                    "s3.path-style-access": "true",
-                },
-            )
-            catalog.list_namespaces()
-            return catalog
+            registered = registry.get_latest_version(subject)
+            return registered.schema_id, json.loads(registered.schema.schema_str)
         except Exception as e:
-            logger.warning(f"Iceberg catalog not ready ({e}), retrying in 2s")
+            logger.warning(f"No contract for {topic} yet ({e}), retrying in 2s")
             time.sleep(2)
-    raise RuntimeError("Could not connect to the Iceberg catalog")
+    raise RuntimeError(f"No contract is registered for {topic} (subject {subject})")
 
 
-def get_or_create_table(catalog) -> Table:
-    namespace = ICEBERG_TABLE.split(".")[0]
-    catalog.create_namespace_if_not_exists(namespace)
-    table = catalog.create_table_if_not_exists(
-        ICEBERG_TABLE,
-        schema=CDR_SCHEMA,
-        partition_spec=CDR_PARTITION_SPEC,
-    )
-    logger.info(f"Using Iceberg table {ICEBERG_TABLE} at {table.location()}")
+def with_commit_retries(table: Table, action, on_conflict=None):
+    """run action(), re-reading the table and retrying if another commit landed first"""
+    for attempt in range(1, COMMIT_ATTEMPTS + 1):
+        try:
+            return action()
+        except CommitFailedException as e:
+            if on_conflict is not None:
+                on_conflict()
+            if attempt == COMMIT_ATTEMPTS:
+                raise
+            logger.warning(f"Iceberg commit conflict, retrying ({attempt}/{COMMIT_ATTEMPTS}): {e}")
+            table.refresh()
+
+
+def prepare_table(catalog, sink: SinkConfig, avro_schema: Dict) -> Table:
+    """create the sink's table, or add the contract's new fields to an existing one"""
+    schema = iceberg_schema(avro_schema)
+    spec = partition_spec(schema, sink.partition_by)
+    catalog.create_namespace_if_not_exists(sink.namespace)
+    table = catalog.create_table_if_not_exists(sink.table, schema=schema, partition_spec=spec)
+
+    changed = with_commit_retries(table, lambda: sync_table_schema(table, avro_schema))
+    if changed:
+        logger.info(f"Added or widened columns {changed} in {sink.table} to match the contract")
+    if describe_spec(schema, spec) != describe_spec(table.schema(), table.spec()):
+        # Iceberg can evolve partitioning, but changing it is a deliberate migration, not a startup side effect
+        logger.warning(f"{sink.table} is partitioned as {describe_spec(table.schema(), table.spec())}, "
+                       f"not as the sink file says; keeping the table's partitioning")
+    for column in filter(None, [sink.sort_by] + [p.column for p in sink.partition_by]):
+        if column not in {f.name for f in table.schema().fields}:
+            raise SinkConfigError(f"{sink.name}: column {column} is not in {sink.table}")
+    logger.info(f"Using Iceberg table {sink.table} at {table.location()}")
     return table
 
 
-def stored_offsets(table: Table) -> Dict[str, int]:
-    """the Kafka offsets of the newest snapshot that recorded them.
-
-    Every writer commit records them, and compaction copies them forward. Walking
-    back through the history also covers a snapshot made by another tool that did not.
-    """
-    snapshot = table.current_snapshot()
-    while snapshot is not None:
-        raw = snapshot.summary.additional_properties.get(OFFSETS_PROPERTY) if snapshot.summary else None
-        if raw:
-            return json.loads(raw)
-        parent = snapshot.parent_snapshot_id
-        snapshot = table.snapshot_by_id(parent) if parent is not None else None
-    return {}
-
-
-def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
-    """parse an ISO timestamp; values without a timezone are treated as UTC"""
-    if not value:
-        return None
-    parsed = datetime.fromisoformat(value)
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def to_row(cdr: Dict, partition: int, offset: int) -> Dict:
-    """map one CDR message to a row of the Iceberg table"""
-    return {
-        "transaction_id": cdr.get("transaction_id"),
-        "customer_id": cdr.get("customer_id"),
-        "full_name": cdr.get("full_name"),
-        "city": cdr.get("city"),
-        "mobile_number": cdr.get("mobile_number"),
-        "sim_serial_number": cdr.get("sim_serial_number"),
-        "sim_status": cdr.get("sim_status"),
-        "imei": cdr.get("imei"),
-        "risk_score": float(cdr["risk_score"]) if cdr.get("risk_score") is not None else None,
-        "fraud_flag": cdr.get("fraud_flag"),
-        "fraud_type": cdr.get("fraud_type"),
-        "type": cdr.get("type"),
-        "amount_eur": float(cdr["amount_eur"]) if cdr.get("amount_eur") is not None else None,
-        "time_stamp": parse_timestamp(cdr.get("time_stamp")),
-        "processed_timestamp": parse_timestamp(cdr.get("processed_timestamp")),
-        "kafka_partition": partition,
-        "kafka_offset": offset,
-        "ingested_at": datetime.now(timezone.utc),
-    }
-
-
 class LakehouseWriter:
-    def __init__(self):
-        ensure_bucket()
-        self.catalog = load_iceberg_catalog()
-        self.table = get_or_create_table(self.catalog)
-        self.arrow_schema = CDR_SCHEMA.as_arrow()
+    def __init__(self, sink: SinkConfig, registry, catalog, consumer, dlq_producer):
+        self.sink = sink
+        self.metrics = SinkMetrics(sink)
+        # JSON is accepted for messages from before the topic had a contract
+        self.decoder = Decoder(registry, allow_json=True)
+        schema_id, avro_schema = latest_contract(registry, sink.topic)
+        self.table = prepare_table(catalog, sink, avro_schema)
+        self.known_schema_ids = {schema_id}
+        self.rows = RowBuilder(self.table.schema())
         self.buffer: List[Dict] = []
         # next offset to read per partition, for the rows in self.buffer
         self.pending_offsets: Dict[int, int] = {}
         self.last_flush = time.monotonic()
         self.running = True
+        self.consumer = consumer
+        self.dlq_producer = dlq_producer
+        # "last commit" starts now, so an alert fires if the first commit never comes
+        self.metrics.last_commit.set_to_current_time()
 
-        self.consumer = Consumer({
+    @classmethod
+    def connect(cls, sink: SinkConfig) -> "LakehouseWriter":
+        """a writer for the sink, connected to the registry, the catalog and Kafka"""
+        ensure_bucket()
+        consumer = Consumer({
             "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
-            "group.id": KAFKA_GROUP_ID,
+            "group.id": sink.consumer_group,
             "auto.offset.reset": "earliest",
             # offsets are committed manually, only after the data is in Iceberg
             "enable.auto.commit": False,
         })
-        self.dlq_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS, "acks": "all"})
+        dlq_producer = Producer({"bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS, "acks": "all"})
+        return cls(sink, registry_client(), load_iceberg_catalog(), consumer, dlq_producer)
 
     def stored_offsets(self) -> Dict[str, int]:
         """offsets saved with the data in the latest Iceberg snapshot"""
         self.table.refresh()
-        return stored_offsets(self.table)
+        return stored_offsets(self.table, self.sink.offsets_property)
 
     def on_assign(self, consumer, partitions):
         """start each partition right after the last row already in Iceberg"""
@@ -238,7 +191,7 @@ class LakehouseWriter:
         consumer.assign(partitions)
         # bring Kafka's committed offsets in line with Iceberg, so consumer lag
         # is correct even for partitions that get no new messages
-        resumed = [TopicPartition(KAFKA_TOPIC, p.partition, p.offset) for p in partitions if p.offset >= 0]
+        resumed = [TopicPartition(self.sink.topic, p.partition, p.offset) for p in partitions if p.offset >= 0]
         if resumed:
             try:
                 consumer.commit(offsets=resumed, asynchronous=False)
@@ -252,35 +205,55 @@ class LakehouseWriter:
 
     def send_to_dlq(self, msg, error: Exception):
         self.dlq_producer.produce(
-            KAFKA_DLQ_TOPIC,
+            self.sink.dead_letter_topic,
             key=msg.key(),
             value=msg.value(),
             headers={
                 "error": str(error),
-                "source": "lakehouse-writer",
+                "source": f"lakehouse-writer/{self.sink.name}",
                 "source_partition": str(msg.partition()),
                 "source_offset": str(msg.offset()),
             },
         )
         self.dlq_producer.flush(10)
-        dlq_messages.inc()
-        logger.warning(f"Sent partition {msg.partition()} offset {msg.offset()} to {KAFKA_DLQ_TOPIC}")
+        self.metrics.dlq_messages.inc()
+        logger.warning(f"Sent partition {msg.partition()} offset {msg.offset()} to {self.sink.dead_letter_topic}")
+
+    def evolve(self, schema_id: int):
+        """add the fields of a contract version seen for the first time to the table"""
+        avro_schema = self.decoder.writer_schema(schema_id)
+        changed = with_commit_retries(self.table, lambda: sync_table_schema(self.table, avro_schema))
+        if changed:
+            self.metrics.schema_changes.inc(len(changed))
+            logger.info(f"Contract version {schema_id} of {self.sink.topic}: "
+                        f"added or widened columns {changed} in {self.sink.table}")
+        self.known_schema_ids.add(schema_id)
+        # rows already buffered lack the new columns, which are written as null
+        self.rows = RowBuilder(self.table.schema())
+
+    def buffer_message(self, msg):
+        """decode one message into a row; one that can never be written goes to the dead-letter topic.
+
+        Other errors, such as the registry being unreachable, propagate and stop the writer:
+        it restarts from the offsets in Iceberg, so nothing is lost or written twice.
+        """
+        try:
+            decoded = self.decoder.decode(msg.value())
+            if decoded.schema_id is not None and decoded.schema_id not in self.known_schema_ids:
+                self.evolve(decoded.schema_id)
+            self.buffer.append(self.rows.build(decoded.value, msg.partition(), msg.offset(),
+                                               datetime.now(timezone.utc)))
+        except (ValueError, TypeError) as e:
+            self.send_to_dlq(msg, e)
+        self.pending_offsets[msg.partition()] = msg.offset() + 1
 
     def flush(self):
         """append the buffered rows to Iceberg, then commit the Kafka offsets"""
         if not self.pending_offsets:
             return
 
-        for attempt in range(1, COMMIT_ATTEMPTS + 1):
-            try:
-                self._append_new_rows()
-                break
-            except CommitFailedException as e:
-                # another commit (e.g. compaction) landed first; re-read the table and retry
-                commit_conflicts.inc()
-                if attempt == COMMIT_ATTEMPTS:
-                    raise
-                logger.warning(f"Iceberg commit conflict, retrying ({attempt}/{COMMIT_ATTEMPTS}): {e}")
+        # another commit (e.g. compaction) may land first; re-read the table and retry
+        with_commit_retries(self.table, self._append_new_rows, on_conflict=self.metrics.commit_conflicts.inc)
 
         # The rows are durable now, so clear the buffer before anything else can fail or
         # call back into flush(): a blocking Kafka commit can trigger on_revoke -> flush()
@@ -293,11 +266,11 @@ class LakehouseWriter:
         # so a failure (e.g. the broker restarting) is logged, not fatal
         try:
             self.consumer.commit(
-                offsets=[TopicPartition(KAFKA_TOPIC, p, o) for p, o in committed.items()],
+                offsets=[TopicPartition(self.sink.topic, p, o) for p, o in committed.items()],
                 asynchronous=False,
             )
         except KafkaException as e:
-            kafka_commit_failures.inc()
+            self.metrics.kafka_commit_failures.inc()
             logger.warning(f"Kafka offset commit failed, consumer lag may be stale: {e}")
 
     def _append_new_rows(self):
@@ -317,26 +290,26 @@ class LakehouseWriter:
                 seen.add(position)
                 rows.append(row)
         if len(rows) < len(self.buffer):
-            rows_skipped.inc(len(self.buffer) - len(rows))
-            logger.warning(f"Skipped {len(self.buffer) - len(rows)} rows already in {ICEBERG_TABLE}")
+            self.metrics.rows_skipped.inc(len(self.buffer) - len(rows))
+            logger.warning(f"Skipped {len(self.buffer) - len(rows)} rows already in {self.sink.table}")
         if not rows:
             return
 
         started = time.monotonic()
-        batch = pa.Table.from_pylist(rows, schema=self.arrow_schema)
-        self.table.append(batch, snapshot_properties={OFFSETS_PROPERTY: json.dumps(offsets)})
+        batch = pa.Table.from_pylist(rows, schema=self.table.schema().as_arrow())
+        self.table.append(batch, snapshot_properties={self.sink.offsets_property: json.dumps(offsets)})
         elapsed = time.monotonic() - started
-        commit_seconds.observe(elapsed)
-        rows_appended.inc(len(rows))
-        last_commit.set_to_current_time()
+        self.metrics.commit_seconds.observe(elapsed)
+        self.metrics.rows_appended.inc(len(rows))
+        self.metrics.last_commit.set_to_current_time()
         logger.info(
-            f"Appended {len(rows)} rows to {ICEBERG_TABLE} in {elapsed:.2f}s "
+            f"Appended {len(rows)} rows to {self.sink.table} in {elapsed:.2f}s "
             f"(snapshot {self.table.current_snapshot().snapshot_id}, offsets {offsets})"
         )
 
     def run(self):
-        self.consumer.subscribe([KAFKA_TOPIC], on_assign=self.on_assign, on_revoke=self.on_revoke)
-        logger.info(f"Writing {KAFKA_TOPIC} to {ICEBERG_TABLE} (group: {KAFKA_GROUP_ID})")
+        self.consumer.subscribe([self.sink.topic], on_assign=self.on_assign, on_revoke=self.on_revoke)
+        logger.info(f"Writing {self.sink.topic} to {self.sink.table} (group: {self.sink.consumer_group})")
         try:
             while self.running:
                 msg = self.consumer.poll(1.0)
@@ -345,16 +318,11 @@ class LakehouseWriter:
                         if msg.error().code() != KafkaError._PARTITION_EOF:
                             logger.error(f"Consumer error: {msg.error()}")
                     else:
-                        try:
-                            cdr = json.loads(msg.value())
-                            self.buffer.append(to_row(cdr, msg.partition(), msg.offset()))
-                        except (ValueError, TypeError, KeyError) as e:
-                            self.send_to_dlq(msg, e)
-                        self.pending_offsets[msg.partition()] = msg.offset() + 1
-                buffered_rows.set(len(self.buffer))
+                        self.buffer_message(msg)
+                self.metrics.buffered_rows.set(len(self.buffer))
 
-                if (len(self.buffer) >= FLUSH_MAX_RECORDS
-                        or time.monotonic() - self.last_flush >= FLUSH_INTERVAL_SECONDS):
+                if (len(self.buffer) >= self.sink.flush_max_records
+                        or time.monotonic() - self.last_flush >= self.sink.flush_interval_seconds):
                     self.flush()
         finally:
             self.flush()
@@ -366,8 +334,11 @@ class LakehouseWriter:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Stream a Kafka topic into an Iceberg table")
+    parser.add_argument("sink", help="sink file, e.g. sinks/cdr_events.yaml")
+    sink = with_env_overrides(load_sink(parser.parse_args().sink))
     start_http_server(METRICS_PORT)
-    writer = LakehouseWriter()
+    writer = LakehouseWriter.connect(sink)
     signal.signal(signal.SIGTERM, writer.stop)
     signal.signal(signal.SIGINT, writer.stop)
     writer.run()

@@ -1,0 +1,23 @@
+{
+  "type": "record",
+  "name": "CallDetailRecord",
+  "namespace": "telecom.cdr",
+  "doc": "One call detail record, published by cdr-ingestion once it has been validated. Key: customer_id.",
+  "fields": [
+    {"name": "transaction_id", "type": "string", "doc": "Unique per CDR"},
+    {"name": "customer_id", "type": "string"},
+    {"name": "full_name", "type": "string"},
+    {"name": "city", "type": "string"},
+    {"name": "mobile_number", "type": "string"},
+    {"name": "sim_serial_number", "type": "string"},
+    {"name": "sim_status", "type": "string", "doc": "active, inactive, suspended, blocked or compromised"},
+    {"name": "imei", "type": "string"},
+    {"name": "risk_score", "type": "double"},
+    {"name": "fraud_flag", "type": "boolean"},
+    {"name": "fraud_type", "type": ["null", "string"], "default": null},
+    {"name": "type", "type": "string", "doc": "Transaction type"},
+    {"name": "amount_eur", "type": "double"},
+    {"name": "time_stamp", "type": {"type": "long", "logicalType": "timestamp-micros"}, "doc": "When the transaction happened (UTC)"},
+    {"name": "processed_timestamp", "type": {"type": "long", "logicalType": "timestamp-micros"}, "doc": "When cdr-ingestion accepted it (UTC)"}
+  ]
+}

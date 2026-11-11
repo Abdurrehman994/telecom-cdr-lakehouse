@@ -1,0 +1,21 @@
+# The fraud detection decision for every CDR, published by ml-service.
+# Columns come from contracts/fraud-decisions-value.avsc.
+name: fraud_decisions
+source:
+  topic: fraud-decisions
+  consumer_group: lakehouse-fraud-decisions
+  dead_letter_topic: fraud-decisions-dlq
+table:
+  identifier: telecom.fraud_decisions
+  # partitioned like cdr_events, so a join on one day reads one partition of each
+  partition_by:
+    - {column: event_time, transform: day, name: event_day}
+  sort_by: event_time
+flush:
+  max_records: 500
+  interval_seconds: 10
+maintenance:
+  compact_min_files: 5
+  snapshot_retain_last: 10
+  snapshot_max_age_hours: 24
+  orphan_min_age_minutes: 1440

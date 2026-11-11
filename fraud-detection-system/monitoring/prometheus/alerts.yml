@@ -37,20 +37,20 @@ groups:
 
       - alert: LakehouseWriterNotCommitting
         expr: |
-          (time() - lakehouse_last_commit_timestamp_seconds > 300)
-          and on() (sum(kafka_consumergroup_lag{consumergroup="lakehouse-writer", topic="cdr-events"}) > 0)
+          (time() - max by (table, consumergroup, topic) (lakehouse_last_commit_timestamp_seconds) > 300)
+          and on(consumergroup, topic) (sum by (consumergroup, topic) (kafka_consumergroup_lag) > 0)
         for: 2m
         labels:
           severity: critical
         annotations:
-          summary: "The lakehouse writer has CDRs to write but has not committed for 5 minutes"
+          summary: "The sink for {{ $labels.table }} has messages to write but has not committed for 5 minutes"
 
       - alert: LakehouseCommitConflicts
         expr: increase(lakehouse_commit_conflicts_total[15m]) > 10
         labels:
           severity: warning
         annotations:
-          summary: "Writer appends keep conflicting with other commits"
+          summary: "Appends to {{ $labels.table }} keep conflicting with other commits"
 
       - alert: LLMUnavailable
         expr: sum(rate(llm_skipped_total[5m])) > 0
@@ -76,14 +76,14 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "{{ $value }} data files averaging under 1 MB; compaction is not keeping up"
+          summary: "{{ $labels.table }}: {{ $value }} data files averaging under 1 MB; compaction is not keeping up"
 
       - alert: LakehouseMaintenanceFailing
         expr: increase(lakehouse_maintenance_failures_total[2h]) > 0
         labels:
           severity: warning
         annotations:
-          summary: "Maintenance task {{ $labels.task }} failed"
+          summary: "Maintenance task {{ $labels.task }} failed for {{ $labels.table }}"
 
       - alert: LakehouseMaintenanceNotRunning
         expr: time() - lakehouse_maintenance_last_success_timestamp_seconds > 3 * 3600
@@ -91,4 +91,4 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "Maintenance task {{ $labels.task }} has not succeeded for 3 hours"
+          summary: "Maintenance task {{ $labels.task }} has not succeeded for {{ $labels.table }} in 3 hours"

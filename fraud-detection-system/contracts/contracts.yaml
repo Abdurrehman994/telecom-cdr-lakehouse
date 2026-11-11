@@ -1,0 +1,19 @@
+# Data contracts: the Avro schema of each topic's messages and how it may change.
+#
+# The contracts job (schema-init in docker-compose.system.yml) registers them with
+#   python -m dataplatform.contracts apply contracts/
+# and the schema registry rejects a version that breaks the compatibility rule.
+#
+# FULL_TRANSITIVE: every version can read data written with every other version, so
+# producers and consumers upgrade in any order and the lakehouse can read all history.
+# In practice: add or remove only fields that have a default.
+contracts:
+  - topic: cdr-events
+    schema: cdr-events-value.avsc
+    compatibility: FULL_TRANSITIVE
+    owner: cdr-ingestion
+
+  - topic: fraud-decisions
+    schema: fraud-decisions-value.avsc
+    compatibility: FULL_TRANSITIVE
+    owner: fraud-detection

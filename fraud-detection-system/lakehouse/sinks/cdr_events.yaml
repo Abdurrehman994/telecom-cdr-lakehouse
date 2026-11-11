@@ -1,0 +1,22 @@
+# Every CDR accepted by cdr-ingestion. Columns come from contracts/cdr-events-value.avsc.
+name: cdr_events
+source:
+  topic: cdr-events
+  consumer_group: lakehouse-writer
+  dead_letter_topic: cdr-events-dlq
+table:
+  identifier: telecom.cdr_events
+  # one folder of files per day, so date-filtered queries skip other days
+  partition_by:
+    - {column: time_stamp, transform: day, name: event_day}
+  sort_by: time_stamp
+flush:
+  # bigger batches mean fewer, larger files and fewer snapshots, but data reaches
+  # the lakehouse later; compaction cleans up what small commits leave behind
+  max_records: 500
+  interval_seconds: 10
+maintenance:
+  compact_min_files: 5
+  snapshot_retain_last: 10
+  snapshot_max_age_hours: 24
+  orphan_min_age_minutes: 1440

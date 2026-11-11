@@ -1,11 +1,15 @@
-# shared by the lakehouse writer and the maintenance job
+# shared by the lakehouse writers and the maintenance job
 x-lakehouse-env: &lakehouse-env
   ICEBERG_CATALOG_URI: http://iceberg-rest:8181
-  ICEBERG_TABLE: telecom.cdr_events
   S3_ENDPOINT: http://seaweedfs:8333
   S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY:-lakehouse}
   S3_SECRET_ACCESS_KEY: ${S3_SECRET_KEY:-lakehouse-secret}
   S3_BUCKET: warehouse
+
+# the platform client library and the data contracts, for images that need them
+x-platform-contexts: &platform-contexts
+  dataplatform: ./libs/dataplatform
+  contracts: ./contracts
 
 services:
   prometheus:
@@ -125,7 +129,9 @@ services:
   #   restart: unless-stopped
 
   ml-service:
-    build: ./ml/
+    build:
+      context: ./ml/
+      additional_contexts: *platform-contexts
     container_name: ml-service
     ports:
       - "8001:8001"
@@ -135,6 +141,8 @@ services:
       KAFKA_TOPIC: cdr-events
       KAFKA_GROUP_ID: fraud-detection
       KAFKA_DLQ_TOPIC: cdr-events-dlq
+      KAFKA_DECISIONS_TOPIC: fraud-decisions
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: cdr_database
@@ -142,6 +150,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud-dev-password}
     depends_on:
       kafka-init:
+        condition: service_completed_successfully
+      schema-init:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -154,7 +164,9 @@ services:
     restart: unless-stopped
 
   ml-service2:
-    build: ./ml/
+    build:
+      context: ./ml/
+      additional_contexts: *platform-contexts
     container_name: ml-service2
     ports:
       - "8002:8001"
@@ -164,6 +176,8 @@ services:
       KAFKA_TOPIC: cdr-events
       KAFKA_GROUP_ID: fraud-detection
       KAFKA_DLQ_TOPIC: cdr-events-dlq
+      KAFKA_DECISIONS_TOPIC: fraud-decisions
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_DB: cdr_database
@@ -171,6 +185,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-fraud-dev-password}
     depends_on:
       kafka-init:
+        condition: service_completed_successfully
+      schema-init:
         condition: service_completed_successfully
       postgres:
         condition: service_healthy
@@ -186,6 +202,7 @@ services:
     build:
       context: ./cdr-ingestion
       dockerfile: Dockerfile
+      additional_contexts: *platform-contexts
     container_name: cdr_ingestion_1
     hostname: cdr-ingestion
     ports:
@@ -195,6 +212,7 @@ services:
       SERVICE_VERSION: 2.0.0
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
       KAFKA_TOPIC: cdr-events
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
       POSTGRES_HOST: postgres
       POSTGRES_PORT: 5432
       POSTGRES_USER: ${POSTGRES_USER:-fraud_user}
@@ -203,6 +221,8 @@ services:
       DEBUG: "False"
     depends_on:
       kafka-init:
+        condition: service_completed_successfully
+      schema-init:
         condition: service_completed_successfully
     networks:
       - fraud-detection-network
@@ -258,6 +278,53 @@ services:
         set -e
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic cdr-events --partitions 3 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic cdr-events-dlq --partitions 1 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud-decisions --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic fraud-decisions-dlq --partitions 1 --replication-factor 1
+    networks:
+      - fraud-detection-network
+    restart: "no"
+
+  # Schema registry: the Avro data contract of each topic, with compatibility rules.
+  # Schemas are stored in the _schemas topic in Kafka.
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.9.1
+    container_name: schema_registry_1
+    hostname: schema-registry
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fs http://localhost:8081/subjects > /dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # One-shot job: registers the data contracts in ./contracts, then exits. It fails,
+  # and the producers and consumers that depend on it do not start, if a contract
+  # breaks its compatibility rule.
+  schema-init:
+    build:
+      context: ./lakehouse/
+      additional_contexts: *platform-contexts
+    container_name: schema_init_1
+    command: ["python", "-m", "dataplatform.contracts", "apply", "/contracts"]
+    environment:
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+    volumes:
+      - ./contracts:/contracts:ro
+    depends_on:
+      schema-registry:
+        condition: service_healthy
     networks:
       - fraud-detection-network
     restart: "no"
@@ -320,23 +387,28 @@ services:
       - fraud-detection-network
     restart: unless-stopped
 
+  # Lakehouse sinks: one writer per sink file in ./lakehouse/sinks. Adding a dataset
+  # takes a contract, a sink file and a service like these; no code.
+
   # Streams cdr-events into the Iceberg table telecom.cdr_events
   lakehouse-writer:
-    build: ./lakehouse/
+    build:
+      context: ./lakehouse/
+      additional_contexts: *platform-contexts
     container_name: lakehouse_writer_1
+    command: ["python", "-u", "writer.py", "sinks/cdr_events.yaml"]
     environment:
       <<: *lakehouse-env
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
-      KAFKA_TOPIC: cdr-events
-      KAFKA_GROUP_ID: lakehouse-writer
-      KAFKA_DLQ_TOPIC: cdr-events-dlq
-      # bigger batches mean fewer, larger files and fewer snapshots, but data reaches
-      # the lakehouse later; compaction cleans up what small commits leave behind
-      FLUSH_MAX_RECORDS: ${LAKEHOUSE_FLUSH_MAX_RECORDS:-500}
-      FLUSH_INTERVAL_SECONDS: ${LAKEHOUSE_FLUSH_INTERVAL_SECONDS:-10}
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      # empty: use the batch size in the sink file; set them to experiment (e.g. a load test)
+      FLUSH_MAX_RECORDS: ${LAKEHOUSE_FLUSH_MAX_RECORDS:-}
+      FLUSH_INTERVAL_SECONDS: ${LAKEHOUSE_FLUSH_INTERVAL_SECONDS:-}
       METRICS_PORT: 8002
     depends_on:
       kafka-init:
+        condition: service_completed_successfully
+      schema-init:
         condition: service_completed_successfully
       iceberg-rest:
         condition: service_started
@@ -344,18 +416,40 @@ services:
       - fraud-detection-network
     restart: unless-stopped
 
-  # Iceberg table maintenance on a schedule: compaction, snapshot expiry, orphan files
+  # Streams fraud-decisions into the Iceberg table telecom.fraud_decisions
+  lakehouse-writer-fraud-decisions:
+    build:
+      context: ./lakehouse/
+      additional_contexts: *platform-contexts
+    container_name: lakehouse_writer_fraud_decisions_1
+    command: ["python", "-u", "writer.py", "sinks/fraud_decisions.yaml"]
+    environment:
+      <<: *lakehouse-env
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      METRICS_PORT: 8002
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      schema-init:
+        condition: service_completed_successfully
+      iceberg-rest:
+        condition: service_started
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # Iceberg table maintenance on a schedule, for every sink's table, with the policy
+  # in its sink file: compaction, snapshot expiry, orphan files
   lakehouse-maintenance:
-    build: ./lakehouse/
+    build:
+      context: ./lakehouse/
+      additional_contexts: *platform-contexts
     container_name: lakehouse_maintenance_1
     command: ["python", "-u", "maintenance.py", "loop"]
     environment:
       <<: *lakehouse-env
       MAINTENANCE_INTERVAL_SECONDS: ${MAINTENANCE_INTERVAL_SECONDS:-3600}
-      COMPACT_MIN_FILES: 5
-      SNAPSHOT_RETAIN_LAST: 10
-      SNAPSHOT_MAX_AGE_HOURS: 24
-      ORPHAN_MIN_AGE_MINUTES: 1440
       METRICS_PORT: 8003
     depends_on:
       iceberg-rest:

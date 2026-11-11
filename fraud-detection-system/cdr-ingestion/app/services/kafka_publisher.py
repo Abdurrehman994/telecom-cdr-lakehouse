@@ -1,11 +1,10 @@
 """Kafka Publisher Service for CDR ingestion"""
-import json
 import logging
 import threading
 import time
 from typing import Dict, Any, List, Optional
-from datetime import datetime
 from confluent_kafka import Producer, KafkaException
+from dataplatform import Encoder, registry_client
 from app.config import settings
 
 
@@ -17,21 +16,17 @@ DELIVERY_TIMEOUT_MS = 10000
 DELIVERY_WAIT_GRACE_SECONDS = 5
 
 
-class DateTimeEncoder(json.JSONEncoder):
-    """Custom JSON encoder for datetime objects"""
-    def default(self, obj):
-        if isinstance(obj, datetime):
-            return obj.isoformat()
-        return super().default(obj)
-
-
 class KafkaPublisher:
     """Handles publishing of CDR records to a Kafka topic"""
 
-    def __init__(self, topic: str = None, bootstrap_servers: str = None):
+    def __init__(self, topic: str = None, bootstrap_servers: str = None, encoder: Encoder = None):
         """Initialize Kafka Publisher"""
         self.topic = topic or settings.kafka_topic
         self.bootstrap_servers = bootstrap_servers or settings.kafka_bootstrap_servers
+        # CDRs are sent as Avro with the topic's registered data contract
+        self.encoder = encoder or Encoder.from_file(
+            registry_client(settings.schema_registry_url), self.topic, settings.cdr_contract_path
+        )
         self.producer: Optional[Producer] = None
 
         logger.info(f"Kafka Publisher initialized for topic: {self.topic}")
@@ -57,10 +52,17 @@ class KafkaPublisher:
                 return False
 
             logger.info(f"Connected to Kafka at {self.bootstrap_servers}")
-            return True
 
         except KafkaException as e:
             logger.error(f"Failed to connect to Kafka: {str(e)}")
+            return False
+
+        try:
+            logger.info(f"Publishing with contract version id {self.encoder.schema_id} for {self.topic}")
+            return True
+        except Exception as e:
+            # publishing retries the lookup, so the service can start before the registry
+            logger.error(f"Data contract for {self.topic} is not available in the schema registry: {e}")
             return False
 
     def _produce(self, message: Dict[str, Any], outcome: Dict[str, Optional[str]]) -> threading.Event:
@@ -76,7 +78,7 @@ class KafkaPublisher:
         self.producer.produce(
             self.topic,
             key=key.encode("utf-8"),
-            value=json.dumps(message, cls=DateTimeEncoder).encode("utf-8"),
+            value=self.encoder.encode(message),
             on_delivery=on_delivery,
         )
         return done
@@ -97,6 +99,9 @@ class KafkaPublisher:
                 pending.append(self._produce(message, outcome))
             except (KafkaException, BufferError) as e:
                 outcome["error"] = str(e)
+            except Exception as e:
+                # the record does not fit the contract, or the registry is unreachable
+                outcome["error"] = f"Could not encode CDR: {e}"
 
         # The producer gives up after delivery.timeout.ms, so this only guards against a lost callback
         deadline = time.monotonic() + DELIVERY_TIMEOUT_MS / 1000 + DELIVERY_WAIT_GRACE_SECONDS

@@ -1,7 +1,7 @@
 {
   "uid": "cdr-pipeline",
   "title": "CDR Pipeline",
-  "description": "Kafka, ingestion, fraud detection, lakehouse writer and Iceberg table health",
+  "description": "Kafka, ingestion, fraud detection, lakehouse sinks and Iceberg table health (pick the table at the top)",
   "tags": [
     "kafka",
     "iceberg",
@@ -9,7 +9,7 @@
   ],
   "timezone": "browser",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "editable": true,
   "refresh": "10s",
   "time": {
@@ -194,7 +194,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "time() - max(lakehouse_last_commit_timestamp_seconds)",
+          "expr": "time() - max(lakehouse_last_commit_timestamp_seconds{table=\"$table\"})",
           "instant": false
         }
       ],
@@ -307,7 +307,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(lakehouse_table_data_files)",
+          "expr": "max(lakehouse_table_data_files{table=\"$table\"})",
           "instant": false
         }
       ],
@@ -1099,12 +1099,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(lakehouse_commit_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(lakehouse_commit_duration_seconds_bucket{table=\"$table\"}[5m])))",
           "legendFormat": "p50"
         },
         {
           "refId": "B",
-          "expr": "histogram_quantile(0.95, sum by (le) (rate(lakehouse_commit_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(lakehouse_commit_duration_seconds_bucket{table=\"$table\"}[5m])))",
           "legendFormat": "p95"
         }
       ],
@@ -1191,7 +1191,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(lakehouse_rows_appended_total[1m]))",
+          "expr": "sum(rate(lakehouse_rows_appended_total{table=\"$table\"}[1m]))",
           "legendFormat": "rows/s"
         }
       ],
@@ -1247,12 +1247,12 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lakehouse_commit_conflicts_total[5m]))",
+          "expr": "sum(increase(lakehouse_commit_conflicts_total{table=\"$table\"}[5m]))",
           "legendFormat": "commit conflicts"
         },
         {
           "refId": "B",
-          "expr": "sum(increase(lakehouse_rows_skipped_total[5m]))",
+          "expr": "sum(increase(lakehouse_rows_skipped_total{table=\"$table\"}[5m]))",
           "legendFormat": "rows already in Iceberg"
         }
       ],
@@ -1352,7 +1352,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(lakehouse_table_data_files)",
+          "expr": "max(lakehouse_table_data_files{table=\"$table\"})",
           "legendFormat": "files"
         }
       ],
@@ -1408,7 +1408,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(lakehouse_table_bytes) / max(lakehouse_table_data_files)",
+          "expr": "max(lakehouse_table_bytes{table=\"$table\"}) / max(lakehouse_table_data_files{table=\"$table\"})",
           "legendFormat": "bytes"
         }
       ],
@@ -1464,7 +1464,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max(lakehouse_table_snapshots)",
+          "expr": "max(lakehouse_table_snapshots{table=\"$table\"})",
           "legendFormat": "snapshots"
         }
       ],
@@ -1520,7 +1520,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "time() - max(lakehouse_maintenance_last_success_timestamp_seconds{task=\"compact\"})",
+          "expr": "time() - max(lakehouse_maintenance_last_success_timestamp_seconds{table=\"$table\", task=\"compact\"})",
           "instant": false
         }
       ],
@@ -1576,7 +1576,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "time() - max(lakehouse_maintenance_last_success_timestamp_seconds{task=\"expire\"})",
+          "expr": "time() - max(lakehouse_maintenance_last_success_timestamp_seconds{table=\"$table\", task=\"expire\"})",
           "instant": false
         }
       ],
@@ -1632,7 +1632,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lakehouse_compaction_files_removed_total[24h]))",
+          "expr": "sum(increase(lakehouse_compaction_files_removed_total{table=\"$table\"}[24h]))",
           "instant": false
         }
       ],
@@ -1689,7 +1689,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(increase(lakehouse_orphan_files_deleted_total[24h]))",
+          "expr": "sum(increase(lakehouse_orphan_files_deleted_total{table=\"$table\"}[24h]))",
           "instant": false
         }
       ],
@@ -1741,7 +1741,30 @@
     }
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "table",
+        "label": "Iceberg table",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "prometheus"
+        },
+        "query": {
+          "query": "label_values(lakehouse_table_data_files, table)",
+          "refId": "table"
+        },
+        "definition": "label_values(lakehouse_table_data_files, table)",
+        "refresh": 2,
+        "current": {
+          "text": "telecom.cdr_events",
+          "value": "telecom.cdr_events"
+        },
+        "multi": false,
+        "includeAll": false,
+        "sort": 1
+      }
+    ]
   },
   "annotations": {
     "list": []

@@ -6,6 +6,11 @@ COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY writer.py query.py maintenance.py ./
+# the platform client library (build context "dataplatform" in docker-compose.system.yml)
+COPY --from=dataplatform . /opt/dataplatform
+RUN pip install --no-cache-dir /opt/dataplatform
 
-CMD ["python", "-u", "writer.py"]
+COPY *.py ./
+COPY sinks/ ./sinks/
+
+CMD ["python", "-u", "writer.py", "sinks/cdr_events.yaml"]

@@ -12,6 +12,12 @@ COPY requirements.txt .
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# the platform client library and the contract of the decisions this service publishes
+# (build contexts "dataplatform" and "contracts" in docker-compose.system.yml)
+COPY --from=dataplatform . /opt/dataplatform
+RUN pip install --no-cache-dir /opt/dataplatform
+COPY --from=contracts fraud-decisions-value.avsc contracts/
+
 # Copy the service code
 COPY ml_service.py .
 
