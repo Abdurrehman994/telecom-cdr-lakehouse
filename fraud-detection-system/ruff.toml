@@ -1,0 +1,9 @@
+# Linting for every Python service and the platform library (run in CI).
+target-version = "py311"
+line-length = 120
+
+[lint]
+# pyflakes, the pycodestyle errors ruff enables by default, and bugbear
+select = ["E4", "E7", "E9", "F", "B"]
+# zip() over sequences built side by side; strict= would only add noise
+ignore = ["B905"]

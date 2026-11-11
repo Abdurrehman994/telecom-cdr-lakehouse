@@ -146,7 +146,7 @@ async def ingest_cdr(record: CDRRecord):
             raise HTTPException(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail=f"Error enriching CDR: {str(e)}"
-            )
+            ) from e
         
         # Save to database
         # try:
@@ -193,7 +193,7 @@ async def ingest_cdr(record: CDRRecord):
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Internal server error: {str(e)}"
-        )
+        ) from e
 
 
 @app.post(
@@ -251,7 +251,7 @@ async def ingest_batch_cdrs(records: list[CDRRecord]):
         publisher_instance.publish_batch, [cdr for _, _, cdr in to_publish]
     )
     publish_seconds.observe(time.monotonic() - started)
-    for (idx, transaction_id, _), error in zip(to_publish, errors):
+    for (idx, transaction_id, _), error in zip(to_publish, errors, strict=False):
         if error is None:
             cdrs_ingested.labels("accepted").inc()
             results["accepted"] += 1
@@ -348,21 +348,21 @@ async def get_fraud_dataset():
         with open(dataset_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         
-        logger.info(f"Fraud dataset retrieved successfully")
+        logger.info("Fraud dataset retrieved successfully")
         return data
         
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
         logger.error("Invalid JSON format in dataset file")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Invalid JSON format in dataset file"
-        )
+        ) from e
     except Exception as e:
         logger.error(f"Error reading dataset file: {str(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error reading dataset: {str(e)}"
-        )
+        ) from e
 
 
 @app.exception_handler(HTTPException)

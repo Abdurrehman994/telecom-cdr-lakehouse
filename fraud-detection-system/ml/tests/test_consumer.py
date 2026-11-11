@@ -1,7 +1,10 @@
 """At-least-once processing, idempotent alerts and decision events in the fraud-detection consumer."""
 import json
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import psycopg
 import pytest
@@ -10,7 +13,7 @@ from dataplatform import Decoder, Encoder
 from dataplatform.testing import registry_with
 
 import ml_service
-from ml_service import CDRConsumer, FraudDetectionEngine
+from ml_service import AlertNotifier, CDRConsumer, FraudDetectionEngine
 
 CONTRACTS = Path(__file__).resolve().parents[2] / "contracts"
 CDR_CONTRACT = (CONTRACTS / "cdr-events-value.avsc").read_text()
@@ -119,7 +122,7 @@ def consumer(monkeypatch, registry):
     c.decision_encoder = Encoder(registry, "fraud-decisions", DECISION_CONTRACT)
     c.running = True
     c.alerts_sent = []
-    monkeypatch.setattr(ml_service, "send_alert_to_prometheus", lambda cdr, result: c.alerts_sent.append(cdr))
+    monkeypatch.setattr(ml_service, "notifier", SimpleNamespace(notify=lambda cdr, result: c.alerts_sent.append(cdr)))
     monkeypatch.setattr(ml_service.time, "sleep", lambda seconds: None)
     return c
 
@@ -313,3 +316,38 @@ def test_rules_pass_an_ordinary_cdr():
     cdr = {"risk_score": 0.2, "mobile_number": "+358401234567", "sim_status": "active", "amount_eur": 30}
 
     assert FraudDetectionEngine().apply_rules(cdr) == {"is_fraud": False}
+
+
+def test_a_slow_alertmanager_does_not_hold_up_detection():
+    """Regression: without alertmanager, waiting on each notification cut throughput 14-fold."""
+    release = threading.Event()
+    sent = []
+    def slow_send(cdr, result):
+        release.wait(5)
+        sent.append(cdr["transaction_id"])
+
+    notifier = AlertNotifier(send=slow_send)
+    notifier.start()
+
+    started = time.monotonic()
+    for n in range(20):
+        notifier.notify({"transaction_id": f"T{n}"}, FRAUD)
+    assert time.monotonic() - started < 0.5
+
+    release.set()
+    notifier.queue.join()
+    assert sent == [f"T{n}" for n in range(20)]
+    notifier.stop()
+
+
+def test_notifications_beyond_the_queue_are_dropped_and_counted():
+    notifier = AlertNotifier(send=lambda cdr, result: None, max_queued=2)  # not started: nothing drains
+    dropped = ml_service.alert_notifications.labels(result="dropped")
+    before = dropped._value.get()
+
+    for n in range(5):
+        notifier.notify({"transaction_id": f"T{n}"}, FRAUD)
+
+    assert notifier.queue.qsize() == 2
+    assert dropped._value.get() == before + 3
+

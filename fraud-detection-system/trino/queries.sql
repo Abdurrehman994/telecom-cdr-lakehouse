@@ -7,19 +7,16 @@ FROM cdr_events
 GROUP BY 1
 ORDER BY cdrs DESC;
 
--- How each detection method did, joining the two sinks' tables on the CDR
--- (decisions are at-least-once, so keep the latest per transaction; a CDR sent twice
--- has two rows in cdr_events, so it is counted once per row)
-WITH decisions AS (
-    SELECT *, row_number() OVER (PARTITION BY transaction_id ORDER BY decided_at DESC) AS n
-    FROM fraud_decisions
-)
+-- How each detection method did, joining the two sinks' tables through the
+-- deduplicated views (trino/views.sql), one row per CDR and its latest decision
 SELECT d.method, count(*) AS decisions, count_if(d.is_fraud) AS flagged,
        count_if(d.is_fraud AND c.fraud_flag) AS flagged_and_labelled_fraud
-FROM decisions d JOIN cdr_events c ON c.transaction_id = d.transaction_id
-WHERE d.n = 1
+FROM fraud_decisions_latest d JOIN cdr_events_unique c ON c.transaction_id = d.transaction_id
 GROUP BY 1
 ORDER BY decisions DESC;
+
+-- CDRs that reached Kafka more than once (client retries); the views hide them
+SELECT count(*) - count(DISTINCT transaction_id) AS extra_copies FROM cdr_events;
 
 -- Partition pruning: only the files of one day partition are read
 SELECT count(*) AS cdrs_on_2025_01_01

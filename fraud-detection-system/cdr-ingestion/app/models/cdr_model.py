@@ -1,7 +1,6 @@
 """SQLAlchemy ORM model for CDR data"""
-from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean, create_engine
+from sqlalchemy import Column, String, Integer, Float, DateTime, Boolean
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 
 Base = declarative_base()

@@ -6,6 +6,22 @@ on:
   pull_request:
 
 jobs:
+  lint:
+    name: lint (ruff) and type check (mypy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fraud-detection-system
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ruff==0.8.6 mypy==1.13.0 types-PyYAML ./libs/dataplatform
+      - run: ruff check .
+      # the platform library is the API other services build on, so it is fully typed
+      - run: mypy --ignore-missing-imports libs/dataplatform/dataplatform
+
   dataplatform-tests:
     name: dataplatform tests (with a schema registry)
     runs-on: ubuntu-latest

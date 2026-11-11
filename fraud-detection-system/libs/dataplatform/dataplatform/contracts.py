@@ -23,7 +23,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Union
 
 import fastavro
 import yaml
@@ -101,7 +101,8 @@ def check(registry: SchemaRegistryClient, contract: Contract) -> str:
     # transitive levels compare with every registered version, the others with the latest only
     # (the registry tests with the subject's current level, so a level change in the same
     # edit is only checked by apply)
-    versions = registry.get_versions(contract.subject) if contract.compatibility.endswith("_TRANSITIVE") else ["latest"]
+    versions: List[Union[int, str]] = (list(registry.get_versions(contract.subject))
+                                       if contract.compatibility.endswith("_TRANSITIVE") else ["latest"])
     for version in versions:
         if not registry.test_compatibility(contract.subject, schema, version=version):
             raise ContractError(f"{contract.subject}: not {contract.compatibility} compatible "

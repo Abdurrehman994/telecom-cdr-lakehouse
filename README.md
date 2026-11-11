@@ -1,4 +1,4 @@
-# Telecom CDR Streaming Lakehouse
+# Streaming Data Platform: Kafka, Data Contracts and an Iceberg Lakehouse
 
 [![CI](https://github.com/Abdurrehman994/telecom-cdr-lakehouse/actions/workflows/ci.yml/badge.svg)](https://github.com/Abdurrehman994/telecom-cdr-lakehouse/actions/workflows/ci.yml)
 
@@ -7,11 +7,11 @@
 > Nabeel Hussain, Muhammad Abdur Rehman, Christoph Gasche, Marko Tiitto and Talha Pasha.
 > Work from November 2026 onward is by Muhammad Abdur Rehman.
 
-Call detail records (CDRs) stream through Kafka into two independent consumers: real-time fraud detection and an Apache Iceberg lakehouse. Every topic has an Avro data contract in a schema registry, and topics land in Iceberg through config-driven sinks: adding a dataset takes a contract and a sink file, not code.
+A small data platform that other services build on: replicated Kafka for event streams, Avro data contracts enforced through a schema registry, config-driven sinks that land topics in Apache Iceberg tables exactly once, a Lakekeeper catalog that vends storage credentials, and Trino for SQL. The workload running on it is telecom fraud detection: call detail records (CDRs) are ingested over HTTP, scored by a fraud detection service, and kept in the lakehouse together with every decision.
 
 ```text
                      Schema Registry (Avro contracts, FULL_TRANSITIVE)
-HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
+HTTP ─► cdr-ingestion ─► Kafka ×3 (cdr-events, keyed by customer_id, replication factor 3)
                             ├─► ml-service ×2 ─► Postgres (fraud_alerts) ─► Alertmanager
                             │        └─► Kafka (fraud-decisions)
                             │                └─► sink: fraud_decisions ─┐
@@ -20,20 +20,35 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
                                                                                   query: Trino, DuckDB
 ```
 
+| Layer | Technology | What the platform provides |
+|---|---|---|
+| Streaming | Apache Kafka 3.9 (KRaft), 3 nodes | Replicated topics (`min.insync.replicas=2`), dead-letter topics, consumer groups |
+| Contracts | Avro, Confluent Schema Registry, `libs/dataplatform` | A schema and compatibility rule per topic; producers can only send registered schemas |
+| Storage | Apache Iceberg on S3 (SeaweedFS) | Atomic commits, schema evolution, partitioning, time travel |
+| Ingestion into the lakehouse | Config-driven sinks (Python, PyIceberg) | One YAML file per dataset; exactly-once from Kafka; compaction and snapshot expiry |
+| Catalog | Lakekeeper on Postgres | Iceberg REST catalog with short-lived, vended storage credentials |
+| Query | Trino, DuckDB | SQL over every table, deduplicated views, metadata tables |
+| Operations | Prometheus, Grafana, Alertmanager, GitHub Actions | Per-table metrics and alerts, failure tests, CI with lint and type checks |
+
 ## Highlights
+
+**Platform**
 
 - **Data contracts.** Each topic's messages have an Avro schema in a schema registry, with `FULL_TRANSITIVE` compatibility. A breaking change is rejected when contracts are registered, and producers can only send with a registered schema. A shared client library (`libs/dataplatform`) does the encoding for every service.
 - **Config-driven lakehouse sinks.** A YAML file per sink names the topic, table, partitioning, batching and maintenance policy; the table's columns come from the contract. New optional contract fields become new columns automatically. A second dataset, fraud decisions, was onboarded with three files and no new code ([how](docs/onboarding-a-dataset.md)).
 - **Exactly-once into Iceberg.** Kafka offsets and the topic's id are stored in the same Iceberg snapshot as the data, so a crash, an offset reset or a recreated topic never duplicates or loses rows.
-- **Idempotent fraud alerts.** Alerts are keyed by `transaction_id`, so replaying the topic creates no duplicate alerts or notifications.
-- **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
-- **Failure handling.** A dead-letter topic for bad messages, retries with backoff when Postgres is down, and consumer rebalancing when a replica stops. Each was tested.
-- **OLTP and OLAP side by side.** Postgres for alert case management; Iceberg tables in a Lakekeeper catalog, queried with Trino or DuckDB, for analytics and snapshot time travel.
-- **Production-grade catalog.** Lakekeeper keeps catalog state in Postgres and vends short-lived storage credentials, so engines such as Trino hold no storage keys. It replaced a SQLite-backed catalog that failed under concurrent commits; the tables moved over without copying data.
-- **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup, safe to run while the writer commits. After a load test it turned 5,081 small files into 301.
-- **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard.
-- **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the test found and fixed two bottlenecks in fraud detection.
 - **Replicated Kafka, tested by killing brokers.** Three nodes, replication factor 3, `min.insync.replicas=2`. With a broker killed mid-stream, writes went on and no accepted CDR was lost or duplicated; with two killed, the API refused writes rather than confirm unreplicated data.
+- **Production-grade catalog.** Lakekeeper keeps catalog state in Postgres and vends short-lived storage credentials, so engines such as Trino hold no storage keys. It replaced a SQLite-backed catalog that failed under concurrent commits; the tables moved over without copying data.
+- **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup for every sink's table, safe to run while the sinks commit. After a load test it turned 5,081 small files into 301.
+- **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard with a per-table view.
+
+**Workload**
+
+- **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
+- **Idempotent fraud alerts.** Alerts are keyed by `transaction_id`, so replaying the topic creates no duplicate alerts or notifications. Notifications are sent off the processing path, so a slow Alertmanager cannot hold up detection.
+- **Failure handling.** A dead-letter topic for bad messages, retries with backoff when Postgres or the schema registry is down, and consumer rebalancing when a replica stops. Each was tested on the running stack, except the registry outage, which has unit tests.
+- **OLTP and OLAP side by side.** Postgres for alert case management; the lakehouse for analytics, with views that keep one row per transaction.
+- **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the tests found and fixed three bottlenecks in fraud detection.
 
 For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md). To add a dataset, see [docs/onboarding-a-dataset.md](docs/onboarding-a-dataset.md).
 
@@ -219,7 +234,9 @@ Open your web browser and navigate to:
   docker exec -it trino trino --catalog lakehouse --schema telecom     # interactive SQL
   docker exec trino trino --catalog lakehouse --schema telecom -f /etc/trino/queries.sql
   ```
-  or with DuckDB, including time travel to an earlier snapshot:
+  `cdr_events_unique` and `fraud_decisions_latest` keep one row per transaction (client retries can put a CDR in Kafka twice; see `trino/views.sql`).
+
+  Or with DuckDB, including time travel to an earlier snapshot:
   ```bash
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
   ```
@@ -254,6 +271,14 @@ docker run --rm -v "$PWD:/src" -w /src/lakehouse python:3.11-slim \
 ```
 
 The lakehouse tests include sinks running against a real Iceberg table (SQLite catalog, local files). The library's own tests are in `libs/dataplatform/tests` (`pip install ./libs/dataplatform -r requirements-test.txt`); the ones against a real schema registry run only with `TEST_SCHEMA_REGISTRY_URL` set, e.g. `http://localhost:8081` with the stack up.
+
+Lint and type checks, as CI runs them (from `fraud-detection-system/`):
+
+```bash
+pip install ruff==0.8.6 mypy==1.13.0 types-PyYAML ./libs/dataplatform
+ruff check .
+mypy --ignore-missing-imports libs/dataplatform/dataplatform
+```
 
 The alert store tests in `ml/tests/test_alert_store_postgres.py` run only with `RUN_POSTGRES_TESTS=1` and `POSTGRES_*` pointing at a disposable database, because they truncate `fraud_alerts`.
 

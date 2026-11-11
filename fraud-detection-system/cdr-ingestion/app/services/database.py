@@ -3,7 +3,7 @@ import logging
 from contextlib import contextmanager
 from typing import Dict, Any, Optional
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from app.config import settings
 from app.models.cdr_model import Base, CDRData
@@ -77,7 +77,7 @@ class DatabaseService:
         try:
             with self.get_session() as session:
                 if session is None:
-                    logger.error(f"Cannot save CDR: database session not initialized")
+                    logger.error("Cannot save CDR: database session not initialized")
                     return False
                 
                 cdr = CDRData(

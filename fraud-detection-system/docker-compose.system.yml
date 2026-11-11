@@ -525,6 +525,7 @@ services:
     volumes:
       - ./trino/catalog:/etc/trino/catalog:ro
       - ./trino/queries.sql:/etc/trino/queries.sql:ro
+      - ./trino/views.sql:/etc/trino/views.sql:ro
     # the JVM sizes its heap from this limit
     mem_limit: 2g
     healthcheck:
@@ -539,6 +540,32 @@ services:
     networks:
       - fraud-detection-network
     restart: unless-stopped
+
+  # One-shot job: creates the deduplicated views (trino/views.sql) once the sinks have
+  # created their tables; recreating them on every start picks up new contract columns
+  trino-init:
+    image: trinodb/trino:484
+    container_name: trino_init_1
+    volumes:
+      - ./trino/views.sql:/etc/trino/views.sql:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for attempt in $$(seq 1 60); do
+          trino --server http://trino:8080 --catalog lakehouse --schema telecom -f /etc/trino/views.sql && exit 0
+          echo "tables not ready yet, retrying in 5s"; sleep 5
+        done
+        exit 1
+    depends_on:
+      trino:
+        condition: service_healthy
+      lakehouse-writer:
+        condition: service_started
+      lakehouse-writer-fraud-decisions:
+        condition: service_started
+    networks:
+      - fraud-detection-network
+    restart: "no"
 
   # Lakehouse sinks: one writer per sink file in ./lakehouse/sinks. Adding a dataset
   # takes a contract, a sink file and a service like these; no code.

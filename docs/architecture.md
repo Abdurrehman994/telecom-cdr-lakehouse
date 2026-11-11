@@ -265,6 +265,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Producer → Kafka | No duplicates or reordering from retries | `enable.idempotence=true`, `acks=all` |
 | Kafka → fraud detection | At least once | Offset stored only after processing |
 | Fraud decision → alert | Effectively once per transaction | `transaction_id` primary key, `ON CONFLICT DO NOTHING`, notify only on insert |
+| Alert → Alertmanager notification | Best effort | Queued after the alert is stored, sent from a background thread; dropped and counted if the queue (1,000) fills |
 | Kafka → Iceberg | Exactly once | Offsets committed in the same Iceberg snapshot as the data |
 | Fraud detection → `fraud-decisions` | At least once | Each decision is confirmed by the broker before the CDR's offset is stored; a replay publishes it again, so consumers deduplicate on `transaction_id` |
 | Producer → topic format | Only registered contract versions | Producers encode with a schema that must already be registered; the registry rejects incompatible versions |
@@ -279,6 +280,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | `lakehouse-writer` crashes mid-batch | Unflushed rows were never committed to Iceberg, so on restart it reads them again from the last stored offsets. No loss, no duplicates. |
 | Kafka offsets lost or rewound | The writer ignores them and resumes from Iceberg. Tested by resetting the group to offset 0. |
 | A topic is deleted and created again | Its id changes, so the sink reads it from the beginning instead of resuming at the old topic's offsets, and `LakehouseSourceTopicRecreated` fires. Tested on the local stack, whose topic had been recreated; see [Exactly-once into Iceberg](#exactly-once-into-iceberg). |
+| Alertmanager unavailable | Alerts are still stored in Postgres; notifications fail fast in the background and are counted (`alert_notifications_total{result="failed"}`). Detection is not slowed. Tested: 516 CDRs per 20 s with Alertmanager stopped, up from 15 before the change. |
 | Ollama unavailable | Uncertain cases fall back to the random forest score. After one failure the LLM is skipped for 30 seconds (circuit breaker), so the partition is not held up waiting for the same failure on every CDR. Tested under load; see [Performance](#performance). |
 | Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
 | A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
@@ -311,7 +313,7 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | Result | 2,250 accepted (after the client's retries), 2,250 in `cdr_events`, 0 lost, 0 rows at a duplicate Kafka position, 0 CDRs without a decision |
 | Duplicates | 16 CDRs are in Kafka twice. The surviving leader had appended them but could not confirm them, so the API answered `503` and the client sent them again; when the followers returned, the first copies were committed too. The sinks wrote each Kafka message once; the duplicates are separate messages with the same `transaction_id` |
 
-The duplicates are the known limitation below ("A client retry can duplicate a CDR in Kafka"), now measured: none with one broker down, 16 of 2,250 with two. Fraud alerts are already deduplicated by `transaction_id`; for the lakehouse, a deduplicated view or a sink-side merge on `transaction_id` would remove them.
+The duplicates are the known limitation below ("A client retry can duplicate a CDR in Kafka"), now measured: none with one broker down, 16 of 2,250 with two. Fraud alerts are already deduplicated by `transaction_id`. For the lakehouse, Trino views ([`trino/views.sql`](../fraud-detection-system/trino/views.sql)) keep one row per transaction: `cdr_events_unique` the first copy of each CDR, `fraud_decisions_latest` the latest decision. The tables keep every message, so nothing is hidden from an audit of what Kafka delivered.
 
 Every other service rode out the outage without a restart. In a first run of this test, the test script itself crashed during the two-broker outage (its own Kafka command hung without a quorum), leaving the cluster down to one node for about 20 minutes; when the brokers were started again, all services, which had been waiting, carried on.
 
@@ -335,7 +337,7 @@ Measured with [`loadtest/loadtest.py`](../fraud-detection-system/loadtest/loadte
 
 Fixed with [table maintenance](#table-maintenance), plus a setting for the commit size (`LAKEHOUSE_FLUSH_MAX_RECORDS`, `LAKEHOUSE_FLUSH_INTERVAL_SECONDS`). After a 10,000-CDR run, compaction rewrote 251 partitions in about 100 seconds: 5,081 files became 301 (one per day), and the table shrank from 36.5 MB to 2.4 MB, because each tiny Parquet file carries its own footer and metadata. Rows and offsets were unchanged.
 
-**Alertmanager on the hot path.** During the end-to-end test of the sinks, Alertmanager was not running, and fraud detection slowed to under 1 CDR/s: every alert waited on a failing call to it, the same pattern as the LLM before its circuit breaker. With Alertmanager started, the rate went from 15 to 217 CDRs per 20 seconds. Notifications belong off the processing path too.
+**Alertmanager on the hot path.** During the end-to-end test of the sinks, Alertmanager was not running, and fraud detection slowed to under 1 CDR/s: every alert waited on a failing call to it, the same pattern as the LLM before its circuit breaker. With Alertmanager started, the rate went from 15 to 217 CDRs per 20 seconds. Fixed the same way as the LLM: the alert is stored in Postgres, which is the durable record, and the notification goes into a bounded queue that a background thread sends from, with a 2-second connect timeout. With Alertmanager stopped again, fraud detection processed 516 CDRs in 20 seconds, more than before the change even with Alertmanager running, since no CDR waits for a notification any more.
 
 **Where the next limits are.** The fraud consumer does a synchronous Postgres insert and an HTTP call per alert; batching inserts and sending alerts asynchronously would raise it. With 3 partitions, at most 3 replicas can share the work. With the LLM enabled, its latency (seconds per call on CPU) bounds the uncertain cases; it belongs off the hot path, for example as a separate review topic.
 
@@ -347,7 +349,7 @@ Every service exports Prometheus metrics, and Grafana loads the **CDR Pipeline**
 |---|---|
 | `kafka-exporter` | Consumer lag per group and partition; topic offsets, which give the produce rate and the DLQ rate |
 | `cdr-ingestion` (`/metrics`) | CDRs by result (`accepted`, `invalid`, `publish_failed`); wait for Kafka confirmation |
-| `ml-service` (`/metrics`) | CDRs processed by outcome; fraud by detection method; LLM calls skipped by the circuit breaker; duplicate alerts skipped |
+| `ml-service` (`/metrics`) | CDRs processed by outcome; fraud by detection method; LLM calls skipped by the circuit breaker; duplicate alerts skipped; alert notifications sent, failed and dropped; decisions published |
 | Each sink's writer (`:8002`) | Rows appended and skipped; Iceberg commit duration; commit conflicts; failed Kafka offset commits; dead-lettered messages; columns added by contract changes; buffered rows; time of last commit |
 | `lakehouse-maintenance` (`:8003`) | Data files, rows, bytes and snapshots per table; files compacted; snapshots expired; orphan files deleted; last success and failures per task and table |
 | `lakekeeper` (`:9000`) | Catalog requests by endpoint and status, and their latency |
@@ -375,6 +377,8 @@ Two things the dashboard caught while it was being built: a maintenance restart 
 ## Data model
 
 Each table has one column per field of its topic's contract ([`cdr-events-value.avsc`](../fraud-detection-system/contracts/cdr-events-value.avsc), [`fraud-decisions-value.avsc`](../fraud-detection-system/contracts/fraud-decisions-value.avsc)), then the lineage columns `kafka_partition`, `kafka_offset` and `ingested_at`.
+
+Trino views `cdr_events_unique` and `fraud_decisions_latest` give one row per transaction (see [Broker failure tests](#broker-failure-tests) for why a CDR can be in Kafka twice). `trino-init` recreates them on every start, so columns added by a new contract version appear in them after a restart.
 
 Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 

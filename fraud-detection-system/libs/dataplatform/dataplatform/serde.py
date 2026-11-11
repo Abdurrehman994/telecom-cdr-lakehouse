@@ -74,6 +74,8 @@ class Encoder:
             registered = self.registry.lookup_schema(
                 subject_for(self.topic), Schema(self.schema_str, "AVRO"), normalize_schemas=True
             )
+            if registered.schema_id is None:
+                raise SchemaRegistryError(404, 40403, f"no id for the {self.topic} schema")
             self._schema_id = registered.schema_id
         return self._schema_id
 
@@ -112,6 +114,8 @@ class Decoder:
                 if e.http_status_code == 404:
                     raise InvalidMessage(f"schema id {schema_id} is not in the registry") from e
                 raise
+            if schema_str is None:
+                raise InvalidMessage(f"schema id {schema_id} has no schema in the registry")
             raw = json.loads(schema_str)
             self._schemas[schema_id] = (raw, fastavro.parse_schema(raw))
         return self._schemas[schema_id]

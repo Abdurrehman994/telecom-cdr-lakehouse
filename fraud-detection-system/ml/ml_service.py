@@ -1,5 +1,6 @@
 import requests
 import json
+import queue
 import threading
 import time
 import numpy as np
@@ -26,6 +27,7 @@ cdr_processed = Counter('cdr_processed_total', 'Total CDRs processed', ['status'
 llm_skipped = Counter('llm_skipped_total', 'Uncertain CDRs scored without the LLM because it recently failed')
 duplicate_alerts_skipped = Counter('duplicate_alerts_skipped_total', 'Redelivered CDRs whose alert was already stored')
 decisions_published = Counter('fraud_decisions_published_total', 'Decisions published to the fraud-decisions topic')
+alert_notifications = Counter('alert_notifications_total', 'Alert notifications to Alertmanager, by result', ['result'])
 
 # FastAPI app
 app = FastAPI(title="ML Fraud Detection Service")
@@ -455,19 +457,13 @@ class CDRConsumer:
     stored, so decisions are at-least-once too; consumers deduplicate on
     transaction_id.
     """
-    def __init__(
-            self,
-            bootstrap_servers=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092"),
-            topic=os.getenv("KAFKA_TOPIC", "cdr-events"),
-            group_id=os.getenv("KAFKA_GROUP_ID", "fraud-detection"),
-            dlq_topic=os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq"),
-            decisions_topic=os.getenv("KAFKA_DECISIONS_TOPIC", "fraud-decisions"),
-            ):
-        self.bootstrap_servers = bootstrap_servers
-        self.topic = topic
-        self.group_id = group_id
-        self.dlq_topic = dlq_topic
-        self.decisions_topic = decisions_topic
+    def __init__(self, bootstrap_servers=None, topic=None, group_id=None, dlq_topic=None, decisions_topic=None):
+        # read when the consumer is created, not when the module is imported
+        self.bootstrap_servers = bootstrap_servers or os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+        self.topic = topic or os.getenv("KAFKA_TOPIC", "cdr-events")
+        self.group_id = group_id or os.getenv("KAFKA_GROUP_ID", "fraud-detection")
+        self.dlq_topic = dlq_topic or os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq")
+        self.decisions_topic = decisions_topic or os.getenv("KAFKA_DECISIONS_TOPIC", "fraud-decisions")
         self.client_id = os.getenv("HOSTNAME", "ml-service")
         self.consumer = None
         self.dlq_producer = None
@@ -588,7 +584,7 @@ class CDRConsumer:
             
             # log result
             if result['is_fraud']:
-                print(f" FRAUD DETECTED!")
+                print(" FRAUD DETECTED!")
                 print(f"   Type: {result.get('fraud_type')}")
                 print(f"   Confidence: {result.get('confidence'):.2%}")
                 print(f"   Method: {result.get('method')}")
@@ -599,7 +595,7 @@ class CDRConsumer:
                     # unstored so this CDR is processed again after restart
                     return
             else:
-                print(f"clean transaction")
+                print("clean transaction")
 
             if not self.publish_decision(cdr, result, msg):
                 return
@@ -615,7 +611,7 @@ class CDRConsumer:
         self.consumer.store_offsets(message=msg)
 
     def record_alert(self, cdr, result, msg) -> bool:
-        """store the alert in postgres and notify alertmanager if it is new.
+        """store the alert in postgres and, if it is new, queue a notification to alertmanager.
 
         a postgres outage is temporary, so the partition waits and retries
         instead of sending a valid CDR to the DLQ. returns False only if the
@@ -634,7 +630,7 @@ class CDRConsumer:
             return False
 
         if is_new:
-            send_alert_to_prometheus(cdr, result)
+            notifier.notify(cdr, result)
         else:
             print(f"alert for {cdr.get('transaction_id')} already stored, not alerting again")
             duplicate_alerts_skipped.inc()
@@ -692,20 +688,66 @@ def send_alert_to_prometheus(cdr: Dict, detection_result: Dict):
             }
         }
         
-        # send to Alertmanager
+        # send to Alertmanager; fail fast, the alert itself is already stored
         response = requests.post(
-            "http://alertmanager:9093/api/v2/alerts",
+            os.getenv("ALERTMANAGER_URL", "http://alertmanager:9093") + "/api/v2/alerts",
             json=[alert],
-            timeout=10
+            timeout=(2, 5)
         )
         
         if response.status_code == 200:
-            print(f"alert sent to grafana")
+            alert_notifications.labels(result='sent').inc()
+            print("alert sent to alertmanager")
         else:
+            alert_notifications.labels(result='failed').inc()
             print(f"alert failed: {response.status_code}")
             
     except Exception as e:
+        alert_notifications.labels(result='failed').inc()
         print(f"failed to send alert: {e}")
+
+
+class AlertNotifier:
+    """sends alert notifications to alertmanager from a background thread.
+
+    the alert is already stored in postgres before it is queued here, so the notification
+    is best effort: a slow or missing alertmanager must not hold up fraud detection (during
+    a test without alertmanager, waiting on it cut throughput from 217 to 15 CDRs per 20 s).
+    notifications wait in a bounded queue; when it is full they are dropped and counted.
+    """
+    def __init__(self, send=None, max_queued=1000):
+        self.queue = queue.Queue(maxsize=max_queued)
+        self.send = send
+        self.thread = None
+
+    def start(self):
+        self.thread = threading.Thread(target=self._run, daemon=True, name="alert-notifier")
+        self.thread.start()
+
+    def _run(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            (self.send or send_alert_to_prometheus)(*item)
+            self.queue.task_done()
+
+    def notify(self, cdr: Dict, result: Dict):
+        """queue a notification; never blocks"""
+        try:
+            self.queue.put_nowait((cdr, result))
+        except queue.Full:
+            alert_notifications.labels(result='dropped').inc()
+            print(f"alert queue full, notification for {cdr.get('transaction_id')} dropped")
+
+    def stop(self):
+        try:
+            self.queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+
+notifier = AlertNotifier()
 
 # FastAPI Endpoints
 @app.on_event("startup")
@@ -714,6 +756,7 @@ async def startup_event():
     global consumer
 
     consumer = CDRConsumer()
+    notifier.start()
 
     def start_consumer():
         # alerts are written to postgres, so it must be reachable before consuming
@@ -732,6 +775,7 @@ async def shutdown_event():
     if consumer:
         consumer.stop()
         time.sleep(2)
+    notifier.stop()
     alert_store.close()
 
 @app.post("/detect")
@@ -741,11 +785,11 @@ async def detect_fraud_endpoint(cdr: Dict):
         result = detector.detect_fraud(cdr)
         
         if result['is_fraud'] and result['confidence'] > 0.7:
-            send_alert_to_prometheus(cdr, result)
+            notifier.notify(cdr, result)
         
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e)) from e
 
 class AlertUpdate(BaseModel):
     status: Literal['open', 'confirmed', 'dismissed']
