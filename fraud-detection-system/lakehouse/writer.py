@@ -261,10 +261,11 @@ class LakehouseWriter:
             logger.warning(f"Skipped {len(self.buffer) - len(rows)} rows already in {ICEBERG_TABLE}")
 
         if rows:
+            started = time.monotonic()
             batch = pa.Table.from_pylist(rows, schema=self.arrow_schema)
             self.table.append(batch, snapshot_properties={OFFSETS_PROPERTY: json.dumps(offsets)})
             logger.info(
-                f"Appended {len(rows)} rows to {ICEBERG_TABLE} "
+                f"Appended {len(rows)} rows to {ICEBERG_TABLE} in {time.monotonic() - started:.2f}s "
                 f"(snapshot {self.table.current_snapshot().snapshot_id}, offsets {offsets})"
             )
 

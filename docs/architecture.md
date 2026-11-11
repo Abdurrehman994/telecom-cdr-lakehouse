@@ -12,6 +12,7 @@ The project started as a University of Oulu group project that used RabbitMQ for
 - [Design decisions](#design-decisions)
 - [Delivery guarantees](#delivery-guarantees)
 - [Failure scenarios](#failure-scenarios)
+- [Performance](#performance)
 - [Data model](#data-model)
 - [Known limitations](#known-limitations)
 - [Path to production](#path-to-production)
@@ -169,10 +170,30 @@ Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO w
 | A malformed message | Sent to `cdr-events-dlq` with the error; processing continues. Tested with a non-JSON message. |
 | `lakehouse-writer` crashes mid-batch | Unflushed rows were never committed to Iceberg, so on restart it reads them again from the last stored offsets. No loss, no duplicates. |
 | Kafka offsets lost or rewound | The writer ignores them and resumes from Iceberg. Tested by resetting the group to offset 0. |
-| Ollama unavailable | Uncertain cases fall back to the random forest score. |
+| Ollama unavailable | Uncertain cases fall back to the random forest score. After one failure the LLM is skipped for 30 seconds (circuit breaker), so the partition is not held up waiting for the same failure on every CDR. Tested under load; see [Performance](#performance). |
 | Postgres unavailable | The ML consumer retries the alert insert with backoff; its partitions wait. Nothing is skipped or sent to the DLQ. Tested. |
 | A CDR is redelivered | The alert insert is a no-op and no second notification is sent. Tested with two full replays. |
 | The Kafka broker stops | Ingestion answers `503` after about 10 seconds, so clients know to retry; consumers wait and rejoin their groups when it returns. Tested: no messages lost, no duplicate rows, no writer restart. With one broker this is an outage; replication would prevent it. |
+
+## Performance
+
+Measured with [`loadtest/loadtest.py`](../fraud-detection-system/loadtest/loadtest.py): 10,000 CDRs (copies of the sample data with unique transaction ids) sent as 20 batches of 500 over 4 concurrent connections. Setup: a laptop with an 8 GB Docker VM, one Kafka broker, 3 partitions, 2 `ml-service` replicas, Ollama not running. These numbers describe this setup, not a production cluster.
+
+| Stage | Throughput | Notes |
+|---|---|---|
+| HTTP → Kafka (confirmed) | 1,594 CDRs/s | Batch latency p50 1.2 s, p95 2.1 s for 500 CDRs, including the wait for broker confirmation |
+| Fraud detection | 46 CDRs/s | 2 replicas; one Postgres insert and one Alertmanager call per fraud alert, synchronously |
+| Lakehouse writer | 86 CDRs/s | 21 commits of about 476 rows; Iceberg commit p50 4.8 s, p95 6.0 s |
+
+### What the load test found
+
+**The LLM path stalled fraud detection.** A 2,000-CDR run processed about 0.5 CDRs/s. With Ollama not running, every uncertain CDR spent about 4 seconds failing to resolve the `ollama` hostname before falling back to the score. A slow or missing dependency held up the whole partition. Fix: a circuit breaker that skips the LLM for 30 seconds after a failure, plus a 2-second connect timeout. The remaining backlog of 1,557 CDRs then cleared in under 40 seconds.
+
+**The random forest retrained on every CDR.** Training was triggered when the buffer held 50 CDRs, but the buffer is a sliding window that never empties, so after the first 50 every clean CDR refit 100 trees on up to 1,000 rows. It now retrains once per 50 new CDRs.
+
+**Iceberg small files.** After the 10,000-CDR run the table had 6,052 data files averaging 2 rows and 6.8 KB. The sample data's timestamps span 301 days and the table is partitioned by day, so each 500-row commit wrote about 240 tiny files. That explains most of the 4.8-second commit time, and it would slow every query. Live CDRs mostly fall into today's partition, so day partitioning suits real-time traffic; backfills and late data spread across many days are what it handles badly. The options are larger commits, coarser partitions (Iceberg can change the partition spec without rewriting data), and scheduled compaction.
+
+**Where the next limits are.** The fraud consumer does a synchronous Postgres insert and an HTTP call per alert; batching inserts and sending alerts asynchronously would raise it. With 3 partitions, at most 3 replicas can share the work. With the LLM enabled, its latency (seconds per call on CPU) bounds the uncertain cases; it belongs off the hot path, for example as a separate review topic.
 
 ## Data model
 
@@ -200,7 +221,7 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 - **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
 - **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
 - **One lakehouse writer.** The offset merge assumes a single writer. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
-- **No table maintenance.** Small files and old snapshots accumulate. Compaction and snapshot expiry need to run on a schedule.
+- **No table maintenance.** Small files and old snapshots accumulate; the load test produced files of 2 rows on average (see [Performance](#performance)). Compaction and snapshot expiry need to run on a schedule.
 - **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication.
 - **No schema contract.** Producers and consumers agree on JSON fields informally; a breaking change would only show up as DLQ messages.
 - **DuckDB loads the snapshot into memory.** Fine for this data volume, not for large tables.
@@ -237,4 +258,7 @@ docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server l
 
 # Query the lakehouse: row counts, duplicates, fraud by type, time travel
 docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
+
+# Load test (adds synthetic CDRs; best run in a separate Compose project, e.g. -p cdr-loadtest)
+python loadtest/loadtest.py --records 10000
 ```
