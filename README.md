@@ -22,6 +22,9 @@ HTTP ─► cdr-ingestion ─► Kafka (cdr-events, keyed by customer_id)
 - **Confirmed ingestion.** The HTTP API answers only after Kafka has stored the CDR, and returns `503` if it could not.
 - **Failure handling.** A dead-letter topic for bad messages, retries with backoff when Postgres is down, and consumer rebalancing when a replica stops. Each was tested.
 - **OLTP and OLAP side by side.** Postgres for alert case management, Iceberg and DuckDB for analytics and snapshot time travel.
+- **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup, safe to run while the writer commits. After a load test it turned 5,081 small files into 301.
+- **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 11 alert rules, and a provisioned Grafana dashboard.
+- **Load tested.** About 1,500 CDRs/s confirmed into Kafka on a laptop; the test found and fixed two bottlenecks in fraud detection.
 
 For the design, trade-offs, tested failure scenarios and production roadmap, see [docs/architecture.md](docs/architecture.md).
 
@@ -149,7 +152,7 @@ Open your web browser and navigate to:
 **First login steps:**
 1. Navigate to http://localhost:3000
 2. Enter your credentials
-3. You'll see the Grafana home page
+3. Open **Dashboards → CDR Pipeline**: consumer lag, throughput, ingestion results, fraud decisions, Iceberg commit times and table health
 
 ### Prometheus
 - **URL**: http://localhost:9090
@@ -194,6 +197,11 @@ Open your web browser and navigate to:
 - **Analytics (OLAP)**: run DuckDB queries, including time travel to an earlier snapshot:
   ```bash
   docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
+  ```
+- **Maintenance**: `lakehouse-maintenance` compacts small files, expires old snapshots and deletes unreferenced files every hour. To check the table or run a job now:
+  ```bash
+  docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py stats
+  docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py compact
   ```
 
 #### NOTE

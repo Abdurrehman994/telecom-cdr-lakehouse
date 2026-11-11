@@ -13,6 +13,7 @@ The project started as a University of Oulu group project that used RabbitMQ for
 - [Delivery guarantees](#delivery-guarantees)
 - [Failure scenarios](#failure-scenarios)
 - [Performance](#performance)
+- [Monitoring](#monitoring)
 - [Data model](#data-model)
 - [Known limitations](#known-limitations)
 - [Path to production](#path-to-production)
@@ -37,6 +38,8 @@ flowchart LR
     LW -->|commit snapshot| CAT[Iceberg REST catalog]
     LW -->|Parquet files| S3[(SeaweedFS<br/>S3 API)]
     CAT -->|metadata files| S3
+    MT[lakehouse-maintenance] -->|compact, expire snapshots| CAT
+    MT -->|delete orphan files| S3
 
     Q[query.py<br/>DuckDB] --> CAT
     Q --> S3
@@ -54,10 +57,12 @@ One topic, two independent consumer groups. Fraud detection and the lakehouse ea
 | `ml-service`, `ml-service2` | Python, scikit-learn, Ollama | Fraud detection: rules, then a random forest, then an LLM for uncertain cases. Also serves the alerts API (`/alerts`) |
 | `postgres` | PostgreSQL 15 | OLTP store for fraud alerts and their case status; schema in `postgres/init/` |
 | `lakehouse-writer` | Python, PyIceberg, PyArrow | Streams CDRs into the Iceberg table `telecom.cdr_events` |
+| `lakehouse-maintenance` | Python, PyIceberg | Hourly compaction, snapshot expiry and orphan file cleanup for the Iceberg table |
 | `iceberg-rest` | Apache Iceberg REST catalog 1.9.1 | Tracks the current metadata file of each table; state kept in SQLite on a volume |
 | `seaweedfs` | SeaweedFS 4.51 | S3-compatible object storage for Parquet data and Iceberg metadata |
 | `query.py` | DuckDB | Analytical (OLAP) queries and snapshot time travel |
-| Prometheus, Grafana, Alertmanager | | Metrics, dashboards and fraud alerts |
+| `kafka-exporter` | kafka-exporter 1.9.0 | Consumer lag per group and topic offsets, for Prometheus |
+| Prometheus, Grafana, Alertmanager | | Metrics from every service, the provisioned "CDR Pipeline" dashboard, pipeline alerts and fraud alerts |
 
 ## Data flow
 
@@ -148,6 +153,24 @@ Iceberg gives the lakehouse database-like guarantees on plain files in object st
 
 The table is partitioned by `day(time_stamp)`, so queries filtered by date skip files for other days.
 
+### Table maintenance
+
+Streaming appends leave many small files, and every commit adds a snapshot that keeps old files alive. `lakehouse-maintenance` runs [`maintenance.py`](../fraud-detection-system/lakehouse/maintenance.py) every hour with three jobs:
+
+- **Compaction.** Each day partition with 5 or more data files is rewritten into one file sorted by `time_stamp`. One commit covers one contiguous range of up to 50 such partitions: it reads the range, checks the row count against the file metadata, and overwrites the range with a filter matching exactly those days, so the old files are dropped and the new ones added atomically.
+- **Snapshot expiry.** Snapshots older than 24 hours are removed from the table metadata, always keeping the newest 10 and the current one. Time travel reaches back that far.
+- **Orphan file cleanup.** Files in the table's storage that no snapshot references are deleted, such as the small files compaction replaced once their snapshots have expired. Only files older than 24 hours are touched (never under 15 minutes), so the files of a commit still in progress are safe.
+
+Compaction runs next to a writer that commits every few seconds, so three rules keep it safe:
+
+1. **Conflicts fail; they don't overwrite.** The compaction commit only succeeds if the table is still at the snapshot it read. If the writer committed in between, Iceberg rejects it with `CommitFailedException` and compaction re-reads the range and retries. Tested on a scratch table: a compaction based on a stale snapshot was rejected, and the row added in between survived.
+2. **The writer retries too.** If compaction commits first, the writer's append fails the same way; the writer re-reads the stored offsets, drops any rows Iceberg already has, and appends again.
+3. **Exactly-once survives compaction.** The compaction snapshot carries the writer's Kafka offsets forward. The writer also walks back through the snapshot history to find the newest snapshot that has them, in case another tool commits without them.
+
+Under load, compaction lost three commit races in a row against the writer, retried each time, and finished: 19,000 rows, no duplicates, offsets summing to 19,000, and no writer restart.
+
+Two implementation notes. PyIceberg's `dynamic_partition_overwrite` would be the natural API, but it only supports identity partitions, not `day()`. And a first version passed one filter of many OR'd days per commit; planning that filter grew superlinearly (20 days over 5,000 files took 31 seconds), so each commit now uses a single date range, which plans in about 3 seconds. Days inside a range that did not need compaction are rewritten with it, so nothing in the range is deleted without being rewritten.
+
 ### SeaweedFS for object storage
 
 Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO was the first choice, but its Docker images are no longer published. SeaweedFS is Apache-licensed, runs as a single container, and is a drop-in replacement for local development. In the cloud this would be Amazon S3 or an equivalent.
@@ -183,7 +206,7 @@ Measured with [`loadtest/loadtest.py`](../fraud-detection-system/loadtest/loadte
 |---|---|---|
 | HTTP → Kafka (confirmed) | 1,594 CDRs/s | Batch latency p50 1.2 s, p95 2.1 s for 500 CDRs, including the wait for broker confirmation |
 | Fraud detection | 46 CDRs/s | 2 replicas; one Postgres insert and one Alertmanager call per fraud alert, synchronously |
-| Lakehouse writer | 86 CDRs/s | 21 commits of about 476 rows; Iceberg commit p50 4.8 s, p95 6.0 s |
+| Lakehouse writer | 86 CDRs/s | 21 commits of about 476 rows; Iceberg commit p50 4.8 s, p95 6.0 s. After upgrading PyIceberg 0.9.1 → 0.11.1: 112 CDRs/s, p50 3.5 s |
 
 ### What the load test found
 
@@ -193,7 +216,38 @@ Measured with [`loadtest/loadtest.py`](../fraud-detection-system/loadtest/loadte
 
 **Iceberg small files.** After the 10,000-CDR run the table had 6,052 data files averaging 2 rows and 6.8 KB. The sample data's timestamps span 301 days and the table is partitioned by day, so each 500-row commit wrote about 240 tiny files. That explains most of the 4.8-second commit time, and it would slow every query. Live CDRs mostly fall into today's partition, so day partitioning suits real-time traffic; backfills and late data spread across many days are what it handles badly. The options are larger commits, coarser partitions (Iceberg can change the partition spec without rewriting data), and scheduled compaction.
 
+Fixed with [table maintenance](#table-maintenance), plus a setting for the commit size (`LAKEHOUSE_FLUSH_MAX_RECORDS`, `LAKEHOUSE_FLUSH_INTERVAL_SECONDS`). After a 10,000-CDR run, compaction rewrote 251 partitions in about 100 seconds: 5,081 files became 301 (one per day), and the table shrank from 36.5 MB to 2.4 MB, because each tiny Parquet file carries its own footer and metadata. Rows and offsets were unchanged.
+
 **Where the next limits are.** The fraud consumer does a synchronous Postgres insert and an HTTP call per alert; batching inserts and sending alerts asynchronously would raise it. With 3 partitions, at most 3 replicas can share the work. With the LLM enabled, its latency (seconds per call on CPU) bounds the uncertain cases; it belongs off the hot path, for example as a separate review topic.
+
+## Monitoring
+
+Every service exports Prometheus metrics, and Grafana loads the **CDR Pipeline** dashboard on startup (<http://localhost:3000>, `admin` / `admin` by default).
+
+| Source | Metrics |
+|---|---|
+| `kafka-exporter` | Consumer lag per group and partition; topic offsets, which give the produce rate and the DLQ rate |
+| `cdr-ingestion` (`/metrics`) | CDRs by result (`accepted`, `invalid`, `publish_failed`); wait for Kafka confirmation |
+| `ml-service` (`/metrics`) | CDRs processed by outcome; fraud by detection method; LLM calls skipped by the circuit breaker; duplicate alerts skipped |
+| `lakehouse-writer` (`:8002`) | Rows appended and skipped; Iceberg commit duration; commit conflicts; failed Kafka offset commits; buffered rows; time of last commit |
+| `lakehouse-maintenance` (`:8003`) | Data files, rows, bytes and snapshots in the table; files compacted; snapshots expired; orphan files deleted; last success and failures per task |
+
+Alert rules ([`alerts.yml`](../fraud-detection-system/monitoring/prometheus/alerts.yml)) go to Alertmanager:
+
+| Alert | Fires when |
+|---|---|
+| `ConsumerLagHigh` | A group is more than 1,000 CDRs behind for 5 minutes |
+| `ConsumerGroupStalled` | A group is behind and has not moved for 10 minutes |
+| `DeadLetterMessages` | Anything reached `cdr-events-dlq` in the last 15 minutes |
+| `IngestPublishFailures` | Ingestion cannot publish to Kafka (clients get 503s) |
+| `LakehouseWriterNotCommitting` | The writer has CDRs to write but no commit for 5 minutes |
+| `LakehouseCommitConflicts` | More than 10 append retries in 15 minutes |
+| `LLMUnavailable` | The circuit breaker has been skipping the LLM for 10 minutes |
+| `LakehouseSmallFiles` | Over 1,000 files averaging under 1 MB for 30 minutes |
+| `LakehouseMaintenanceFailing`, `LakehouseMaintenanceNotRunning` | A task failed, or has not succeeded for 3 hours |
+| `TargetDown` | Prometheus cannot scrape a service for 2 minutes |
+
+Two things the dashboard caught while it was being built: a maintenance restart showed the table at 0 files until the first run finished (the gauges now read the table at startup), and the maintenance job crash-looped on a fresh stack because the table did not exist yet (it now waits for the writer to create it).
 
 ## Data model
 
@@ -221,7 +275,8 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 - **The random forest is trained per replica, in memory.** Each replica only sees its own partitions, and the model is lost on restart. As a result, replaying the same CDRs can give different decisions: in testing, one CDR was clean on the first replay and fraud on the second. A shared model registry, offline training from the lakehouse, and storing the model version with each alert would fix this.
 - **The first decision wins.** If a replay produces a different decision for a CDR that already has an alert, the stored alert is not updated. With model versions recorded, a re-scoring job could compare and update them deliberately.
 - **One lakehouse writer.** The offset merge assumes a single writer. Two replicas would need to handle Iceberg commit conflicts, or write per-partition.
-- **No table maintenance.** Small files and old snapshots accumulate; the load test produced files of 2 rows on average (see [Performance](#performance)). Compaction and snapshot expiry need to run on a schedule.
+- **Compaction competes with the writer.** PyIceberg rejects a commit whenever anything else committed since it read the table, even an append to an unrelated partition. Under constant writes, compaction can retry several times (it lost three races in a row in testing) and could give up after five. Iceberg's Java implementation validates conflicts per file instead, so non-overlapping appends do not block a rewrite; Spark's `rewrite_data_files` would avoid this.
+- **Compaction holds a range in memory.** Each commit reads up to 50 day partitions into memory before rewriting them. Fine at this scale; larger tables need smaller ranges or a distributed engine.
 - **Test-grade catalog.** `iceberg-rest-fixture` is the reference implementation, with SQLite storage and no authentication.
 - **No schema contract.** Producers and consumers agree on JSON fields informally; a breaking change would only show up as DLQ messages.
 - **DuckDB loads the snapshot into memory.** Fine for this data volume, not for large tables.
@@ -236,9 +291,9 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 | Storage | SeaweedFS, one container | S3 or equivalent, with lifecycle rules |
 | Query engine | DuckDB, in memory | Trino or Spark for large scans; DuckDB for local analysis |
 | Lakehouse writes | Python writer | Kafka Connect Iceberg sink or Flink, for higher throughput |
-| Table maintenance | None | Scheduled compaction, snapshot expiry and orphan file cleanup |
+| Table maintenance | Python job: compaction, snapshot expiry, orphan cleanup, every hour | The same jobs in Spark (`rewrite_data_files`, `expire_snapshots`, `remove_orphan_files`) or the catalog's managed maintenance, scheduled by an orchestrator |
 | OLTP | One Postgres container, schema from an init script | Managed Postgres with replicas and backups; schema migrations with a tool such as Alembic or Flyway |
-| Monitoring | Prometheus, Alertmanager | Plus consumer lag alerts per group, DLQ rate, and writer commit latency |
+| Monitoring | Prometheus, Grafana dashboard, alert rules, one Alertmanager with no receivers | Alerts routed to on-call (e.g. PagerDuty, Slack); long-term metric storage; dashboards and rules kept in version control, as here |
 | Deployment | Docker Compose | Kubernetes, with Kafka run by an operator such as Strimzi |
 | Secrets | Defaults in Compose | A secret manager; no defaults outside local development |
 
@@ -247,8 +302,8 @@ Iceberg table `telecom.cdr_events`, partitioned by `day(time_stamp)`:
 From `fraud-detection-system/`:
 
 ```bash
-# Start the pipeline
-docker compose -f docker-compose.system.yml up -d --build cdr-ingestion ml-service ml-service2 lakehouse-writer
+# Start the pipeline, table maintenance and monitoring
+docker compose -f docker-compose.system.yml up -d --build cdr-ingestion ml-service ml-service2 lakehouse-writer     lakehouse-maintenance kafka-exporter prometheus grafana
 
 # Send the sample dataset (800 CDRs)
 python ingest-auto/ingest-auto.py --batch-size 50
@@ -259,6 +314,15 @@ docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server l
 # Query the lakehouse: row counts, duplicates, fraud by type, time travel
 docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python query.py
 
+# Table health: snapshots, data files, rows, bytes
+docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py stats
+
+# Run maintenance now instead of waiting for the hourly run
+docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py compact
+docker compose -f docker-compose.system.yml run --rm --no-deps lakehouse-writer python maintenance.py orphans --dry-run
+
 # Load test (adds synthetic CDRs; best run in a separate Compose project, e.g. -p cdr-loadtest)
 python loadtest/loadtest.py --records 10000
 ```
+
+Dashboard: <http://localhost:3000> → CDR Pipeline. Prometheus alerts: <http://localhost:9090/alerts>.
