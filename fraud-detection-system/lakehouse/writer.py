@@ -22,7 +22,9 @@ from typing import Dict, List, Optional
 import pyarrow as pa
 from pyarrow import fs
 from confluent_kafka import Consumer, KafkaError, KafkaException, Producer, TopicPartition
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import CommitFailedException
 from pyiceberg.partitioning import PartitionField, PartitionSpec
 from pyiceberg.schema import Schema
 from pyiceberg.table import Table
@@ -50,6 +52,19 @@ KAFKA_DLQ_TOPIC = os.getenv("KAFKA_DLQ_TOPIC", "cdr-events-dlq")
 ICEBERG_TABLE = os.getenv("ICEBERG_TABLE", "telecom.cdr_events")
 FLUSH_MAX_RECORDS = int(os.getenv("FLUSH_MAX_RECORDS", "500"))
 FLUSH_INTERVAL_SECONDS = float(os.getenv("FLUSH_INTERVAL_SECONDS", "10"))
+# an append can lose a race with a maintenance commit; it is retried on the new snapshot
+COMMIT_ATTEMPTS = int(os.getenv("COMMIT_ATTEMPTS", "5"))
+METRICS_PORT = int(os.getenv("METRICS_PORT", "8002"))
+
+rows_appended = Counter("lakehouse_rows_appended_total", "Rows appended to the Iceberg table")
+rows_skipped = Counter("lakehouse_rows_skipped_total", "Buffered rows skipped because Iceberg already had them")
+commit_seconds = Histogram("lakehouse_commit_duration_seconds", "Time to append one batch to Iceberg",
+                           buckets=(0.25, 0.5, 1, 2, 4, 8, 16, 32, 64))
+commit_conflicts = Counter("lakehouse_commit_conflicts_total", "Appends retried after a concurrent Iceberg commit")
+kafka_commit_failures = Counter("lakehouse_kafka_commit_failures_total", "Failed Kafka offset commits (lag reporting only)")
+dlq_messages = Counter("lakehouse_dlq_messages_total", "Messages the writer sent to the dead-letter topic")
+buffered_rows = Gauge("lakehouse_buffered_rows", "Rows read from Kafka but not yet in Iceberg")
+last_commit = Gauge("lakehouse_last_commit_timestamp_seconds", "Unix time of the last successful append")
 
 # snapshot property that holds the next Kafka offset to read, per partition
 OFFSETS_PROPERTY = f"kafka.{KAFKA_TOPIC}.offsets"
@@ -139,6 +154,22 @@ def get_or_create_table(catalog) -> Table:
     return table
 
 
+def stored_offsets(table: Table) -> Dict[str, int]:
+    """the Kafka offsets of the newest snapshot that recorded them.
+
+    Every writer commit records them, and compaction copies them forward. Walking
+    back through the history also covers a snapshot made by another tool that did not.
+    """
+    snapshot = table.current_snapshot()
+    while snapshot is not None:
+        raw = snapshot.summary.additional_properties.get(OFFSETS_PROPERTY) if snapshot.summary else None
+        if raw:
+            return json.loads(raw)
+        parent = snapshot.parent_snapshot_id
+        snapshot = table.snapshot_by_id(parent) if parent is not None else None
+    return {}
+
+
 def parse_timestamp(value: Optional[str]) -> Optional[datetime]:
     """parse an ISO timestamp; values without a timezone are treated as UTC"""
     if not value:
@@ -195,11 +226,7 @@ class LakehouseWriter:
     def stored_offsets(self) -> Dict[str, int]:
         """offsets saved with the data in the latest Iceberg snapshot"""
         self.table.refresh()
-        snapshot = self.table.current_snapshot()
-        if snapshot is None or snapshot.summary is None:
-            return {}
-        raw = snapshot.summary.additional_properties.get(OFFSETS_PROPERTY)
-        return json.loads(raw) if raw else {}
+        return stored_offsets(self.table)
 
     def on_assign(self, consumer, partitions):
         """start each partition right after the last row already in Iceberg"""
@@ -236,6 +263,7 @@ class LakehouseWriter:
             },
         )
         self.dlq_producer.flush(10)
+        dlq_messages.inc()
         logger.warning(f"Sent partition {msg.partition()} offset {msg.offset()} to {KAFKA_DLQ_TOPIC}")
 
     def flush(self):
@@ -243,31 +271,16 @@ class LakehouseWriter:
         if not self.pending_offsets:
             return
 
-        # merge with the stored offsets so partitions without new rows keep theirs
-        stored = self.stored_offsets()
-        offsets = dict(stored)
-        for p, o in self.pending_offsets.items():
-            offsets[str(p)] = max(o, stored.get(str(p), 0))
-
-        # Append only rows Iceberg does not have yet, each once. Normally that is the whole
-        # buffer; this guards against writing a batch twice after a failure or a rebalance.
-        rows, seen = [], set()
-        for row in self.buffer:
-            position = (row["kafka_partition"], row["kafka_offset"])
-            if row["kafka_offset"] >= stored.get(str(row["kafka_partition"]), 0) and position not in seen:
-                seen.add(position)
-                rows.append(row)
-        if len(rows) < len(self.buffer):
-            logger.warning(f"Skipped {len(self.buffer) - len(rows)} rows already in {ICEBERG_TABLE}")
-
-        if rows:
-            started = time.monotonic()
-            batch = pa.Table.from_pylist(rows, schema=self.arrow_schema)
-            self.table.append(batch, snapshot_properties={OFFSETS_PROPERTY: json.dumps(offsets)})
-            logger.info(
-                f"Appended {len(rows)} rows to {ICEBERG_TABLE} in {time.monotonic() - started:.2f}s "
-                f"(snapshot {self.table.current_snapshot().snapshot_id}, offsets {offsets})"
-            )
+        for attempt in range(1, COMMIT_ATTEMPTS + 1):
+            try:
+                self._append_new_rows()
+                break
+            except CommitFailedException as e:
+                # another commit (e.g. compaction) landed first; re-read the table and retry
+                commit_conflicts.inc()
+                if attempt == COMMIT_ATTEMPTS:
+                    raise
+                logger.warning(f"Iceberg commit conflict, retrying ({attempt}/{COMMIT_ATTEMPTS}): {e}")
 
         # The rows are durable now, so clear the buffer before anything else can fail or
         # call back into flush(): a blocking Kafka commit can trigger on_revoke -> flush()
@@ -284,7 +297,42 @@ class LakehouseWriter:
                 asynchronous=False,
             )
         except KafkaException as e:
+            kafka_commit_failures.inc()
             logger.warning(f"Kafka offset commit failed, consumer lag may be stale: {e}")
+
+    def _append_new_rows(self):
+        """append the buffered rows Iceberg does not have yet, with the next offsets"""
+        # merge with the stored offsets so partitions without new rows keep theirs
+        stored = self.stored_offsets()
+        offsets = dict(stored)
+        for p, o in self.pending_offsets.items():
+            offsets[str(p)] = max(o, stored.get(str(p), 0))
+
+        # Append only rows Iceberg does not have yet, each once. Normally that is the whole
+        # buffer; this guards against writing a batch twice after a failure or a rebalance.
+        rows, seen = [], set()
+        for row in self.buffer:
+            position = (row["kafka_partition"], row["kafka_offset"])
+            if row["kafka_offset"] >= stored.get(str(row["kafka_partition"]), 0) and position not in seen:
+                seen.add(position)
+                rows.append(row)
+        if len(rows) < len(self.buffer):
+            rows_skipped.inc(len(self.buffer) - len(rows))
+            logger.warning(f"Skipped {len(self.buffer) - len(rows)} rows already in {ICEBERG_TABLE}")
+        if not rows:
+            return
+
+        started = time.monotonic()
+        batch = pa.Table.from_pylist(rows, schema=self.arrow_schema)
+        self.table.append(batch, snapshot_properties={OFFSETS_PROPERTY: json.dumps(offsets)})
+        elapsed = time.monotonic() - started
+        commit_seconds.observe(elapsed)
+        rows_appended.inc(len(rows))
+        last_commit.set_to_current_time()
+        logger.info(
+            f"Appended {len(rows)} rows to {ICEBERG_TABLE} in {elapsed:.2f}s "
+            f"(snapshot {self.table.current_snapshot().snapshot_id}, offsets {offsets})"
+        )
 
     def run(self):
         self.consumer.subscribe([KAFKA_TOPIC], on_assign=self.on_assign, on_revoke=self.on_revoke)
@@ -303,6 +351,7 @@ class LakehouseWriter:
                         except (ValueError, TypeError, KeyError) as e:
                             self.send_to_dlq(msg, e)
                         self.pending_offsets[msg.partition()] = msg.offset() + 1
+                buffered_rows.set(len(self.buffer))
 
                 if (len(self.buffer) >= FLUSH_MAX_RECORDS
                         or time.monotonic() - self.last_flush >= FLUSH_INTERVAL_SECONDS):
@@ -317,6 +366,7 @@ class LakehouseWriter:
 
 
 if __name__ == "__main__":
+    start_http_server(METRICS_PORT)
     writer = LakehouseWriter()
     signal.signal(signal.SIGTERM, writer.stop)
     signal.signal(signal.SIGINT, writer.stop)
