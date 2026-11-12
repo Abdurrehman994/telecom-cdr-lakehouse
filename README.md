@@ -42,6 +42,7 @@ HTTP ─► cdr-ingestion ─► Kafka ×3 (cdr-events, keyed by customer_id, re
 - **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup for every sink's table, safe to run while the sinks commit. After a load test it turned 5,081 small files into 301.
 - **Runs on Kubernetes.** Kafka by the Strimzi operator, the rest from a Helm chart: one Deployment per sink, maintenance as a CronJob. Tested by deleting a Kafka pod mid-stream: no accepted event lost, and the test found a startup bug that Compose had hidden.
 - **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard with a per-table view.
+- **Live demo console.** An animated view of the running pipeline that follows a single CDR from the API to its Iceberg snapshot, and kills brokers on demand ([how](#live-demo-console)).
 
 **Workload**
 
@@ -57,6 +58,8 @@ For the design, trade-offs, tested failure scenarios and production roadmap, see
 - [Prerequisites](#prerequisites)
 - [Initial Setup](#initial-setup)
 - [Starting the Stack](#starting-the-stack)
+- [Live Demo Console](#live-demo-console)
+- [Running on Kubernetes](#running-on-kubernetes)
 - [Accessing Services](#accessing-services)
 - [Running Tests](#running-tests)
 - [Security Best Practices](#security-best-practices)
@@ -164,6 +167,25 @@ python ingest-auto.py
 ```
 
 ---
+
+## Live Demo Console
+
+A web page that shows the pipeline running, with controls to drive it. It reads every stage once a second (the services' metrics, Kafka's metadata and offsets, and Iceberg through Trino) and animates records moving between the stages.
+
+```bash
+cd fraud-detection-system
+docker compose -f docker-compose.system.yml --profile demo up -d demo-console
+```
+
+Then open <http://localhost:8090>.
+
+- **Follow one CDR.** Sends one record and moves it through each stage only once that stage confirms it. The steps are: the API's `202`, its partition and offset in `cdr-events`, the fraud decision event, the alert in Postgres, and the Iceberg snapshot that committed the row with the Kafka offsets.
+- **Traffic.** 5 to 25 CDRs/s. Rejected CDRs are sent again, as a real client would.
+- **Valid or invalid CDR.** An invalid IMEI is refused with `400` and never reaches Kafka.
+- **Kill or start a broker.** Watch partition leaders move and in-sync replicas drop to 2 while writes go on. With two brokers down, the controller quorum is lost and the API refuses writes.
+- **Compact now.** Small files merged into fewer, row count unchanged, shown as a new snapshot.
+
+It runs under the `demo` profile only, because it needs the Docker socket to stop and start brokers.
 
 ## Running on Kubernetes
 
@@ -432,11 +454,7 @@ docker compose -f docker-compose.system.yml logs -f
 | Lakekeeper | 8181 | http://localhost:8181/ui | Iceberg REST catalog and its UI |
 | Trino | 8085 | http://localhost:8085/ui | SQL over the lakehouse |
 | SeaweedFS | 8333 | http://localhost:8333 | S3 API |
-| Ingestion API | 8080 | http://localhost:8080/docs | Send CDRs |
-| Schema Registry | 8081 | http://localhost:8081/subjects | Data contracts |
-| Lakekeeper | 8181 | http://localhost:8181/ui | Iceberg REST catalog and its UI |
-| Trino | 8085 | http://localhost:8085/ui | SQL over the lakehouse |
-| SeaweedFS | 8333 | http://localhost:8333 | S3 API |
+| Demo console | 8090 | http://localhost:8090 | Live pipeline view (`demo` profile) |
 
 ---
 

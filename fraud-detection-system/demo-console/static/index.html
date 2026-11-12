@@ -1,0 +1,612 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pipeline Demo Console</title>
+<style>
+  :root {
+    --bg: #0d1420; --panel: #141e2e; --panel-2: #1a2639; --line: #2a3a54; --text: #e6edf7;
+    --muted: #8a9bb4; --ingest: #4aa3ff; --clean: #9fb7d6; --fraud: #ff5c6c; --decision: #b48cff;
+    --data: #3ddc97; --warn: #ffb547; --iceberg: #3cc6d8; --trace: #ffd166;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 14px 20px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  header .sub { color: var(--muted); }
+  header .status { margin-left: auto; color: var(--muted); font-size: 12px; }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: var(--data); }
+  main { display: grid; grid-template-columns: minmax(0, 1fr) 320px; gap: 16px; padding: 16px 20px; }
+  @media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; }
+  #diagram-card { padding: 8px; }
+  svg { width: 100%; height: auto; display: block; }
+  aside { display: flex; flex-direction: column; gap: 12px; }
+  aside .card { padding: 12px 14px; }
+  h2 { margin: 0 0 8px; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+  .row { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  button { background: var(--panel-2); color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+           padding: 6px 10px; font: inherit; cursor: pointer; }
+  button:hover { border-color: var(--ingest); }
+  button.active { background: var(--ingest); border-color: var(--ingest); color: #04111f; font-weight: 600; }
+  button.danger:hover { border-color: var(--fraud); }
+  button:disabled { opacity: .5; cursor: default; }
+  .small { color: var(--muted); font-size: 12px; }
+  .result { margin-top: 6px; font-size: 12px; min-height: 16px; }
+  .ok { color: var(--data); } .bad { color: var(--fraud); } .info { color: var(--clean); }
+  .broker { display: grid; grid-template-columns: 1fr auto auto; gap: 6px; align-items: center; margin: 4px 0; }
+  #bottom { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; padding: 0 20px 20px; }
+  @media (max-width: 1100px) { #bottom { grid-template-columns: 1fr; } }
+  #bottom .card { padding: 12px 14px; }
+  #explain h3 { margin: 0 0 6px; font-size: 16px; }
+  #explain p { margin: 6px 0; color: #c9d4e5; }
+  #explain code { background: var(--panel-2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  #log { list-style: none; margin: 0; padding: 0; max-height: 220px; overflow-y: auto; font: 12px/1.6 ui-monospace, Consolas, monospace; }
+  #log li { border-bottom: 1px solid #1d2a3d; padding: 2px 0; }
+  #log .t { color: var(--muted); margin-right: 8px; }
+  #log .data { color: var(--data); } #log .bad { color: var(--fraud); } #log .good { color: var(--data); } #log .info { color: var(--clean); }
+
+  /* diagram */
+  .node rect.box { fill: var(--panel-2); stroke: var(--line); stroke-width: 1.5; rx: 10; }
+  .node { cursor: pointer; }
+  .node:hover rect.box { stroke: var(--ingest); }
+  .node.selected rect.box { stroke: var(--ingest); stroke-width: 2.5; }
+  .node.flash rect.box { animation: flash 0.9s ease-out; }
+  @keyframes flash { 0% { stroke: var(--data); stroke-width: 4; } 100% { stroke: var(--line); stroke-width: 1.5; } }
+  .node.shake rect.box { animation: shake 0.4s; stroke: var(--fraud); }
+  .lane.flash { animation: flash 0.9s ease-out; }
+  @keyframes shake { 25% { transform: translateX(-4px); } 75% { transform: translateX(4px); } }
+  .title { fill: var(--text); font-size: 14px; font-weight: 600; }
+  .label { fill: var(--muted); font-size: 11.5px; }
+  .value { fill: var(--text); font-size: 12.5px; }
+  .big { fill: var(--text); font-size: 20px; font-weight: 600; }
+  .edge { fill: none; stroke: #23324a; stroke-width: 2; }
+  .edge.red { stroke: #3a2430; } .edge.purple { stroke: #2e2846; } .edge.green { stroke: #1f3b33; }
+  .lane { fill: #121c2b; stroke: var(--data); stroke-width: 1.2; rx: 6; transition: stroke .3s; }
+  .lane.degraded { stroke: var(--warn); } .lane.down { stroke: var(--fraud); }
+  .chip { rx: 5; stroke-width: 1.2; transition: fill .3s; }
+  .chip.up { fill: #12352a; stroke: var(--data); } .chip.down { fill: #3b1620; stroke: var(--fraud); }
+  .chip.joining { fill: #3a2c10; stroke: var(--warn); }
+  .bar-bg { fill: #0f1826; stroke: var(--line); rx: 4; }
+  .bar { fill: var(--data); rx: 4; transition: width .5s; }
+  .snap { fill: #12303a; stroke: var(--iceberg); stroke-width: 1; rx: 5; }
+  .snap.maint { fill: #2b2a14; stroke: var(--warn); }
+  .packet { fill: var(--data); }
+  .packet-text { fill: #04111f; font-size: 11px; font-weight: 700; }
+  #offline { fill: var(--fraud); font-size: 13px; font-weight: 600; }
+
+  /* following one CDR */
+  .trace-halo { fill: none; stroke: var(--trace); stroke-width: 2; transform-box: fill-box; transform-origin: center;
+                animation: halo 1.2s ease-out infinite; }
+  @keyframes halo { from { opacity: .9; transform: scale(.6); } to { opacity: 0; transform: scale(1.8); } }
+  .trace-token.failed .trace-halo { stroke: var(--fraud); }
+  .trace-label { fill: var(--trace); font-size: 11px; font-weight: 700; }
+  #trace-card { border-color: #5a4a1c; }
+  #trace-id { margin-top: 6px; }
+  #trace-steps { list-style: none; margin: 6px 0 0; padding: 0; }
+  #trace-steps li { display: grid; grid-template-columns: 16px 1fr; gap: 6px; padding: 5px 0; border-top: 1px solid #1d2a3d; }
+  #trace-steps .ic { font-weight: 700; color: var(--muted); }
+  #trace-steps .done .ic { color: var(--data); } #trace-steps .failed .ic { color: var(--fraud); }
+  #trace-steps .waiting b, #trace-steps .skipped b { color: var(--muted); font-weight: 500; }
+  #trace-steps .waiting .ic { color: var(--trace); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Streaming Data Platform · live pipeline</h1>
+  <span class="sub">Kafka · data contracts · fraud detection · Apache Iceberg</span>
+  <span class="status" id="status"><span class="dot"></span>connecting…</span>
+</header>
+
+<main>
+  <div class="card" id="diagram-card">
+    <svg viewBox="0 0 1320 620" id="svg" role="img" aria-label="Animated pipeline diagram">
+      <!-- edges first, so nodes and particles draw on top -->
+      <g id="edges">
+        <path class="edge" id="e-client-ing" d="M140,300 L180,300"/>
+        <path class="edge" id="e-ing-p0" d="M330,300 C360,300 360,250 390,250"/>
+        <path class="edge" id="e-ing-p1" d="M330,300 C360,300 360,320 390,320"/>
+        <path class="edge" id="e-ing-p2" d="M330,300 C360,300 360,390 390,390"/>
+        <path class="edge" id="e-p0-fraud" d="M600,250 C640,250 630,120 670,120"/>
+        <path class="edge" id="e-p1-fraud" d="M600,320 C640,320 630,120 670,120"/>
+        <path class="edge" id="e-p2-fraud" d="M600,390 C640,390 630,120 670,120"/>
+        <path class="edge" id="e-p0-sink" d="M600,250 C640,250 630,455 670,455"/>
+        <path class="edge" id="e-p1-sink" d="M600,320 C640,320 630,455 670,455"/>
+        <path class="edge" id="e-p2-sink" d="M600,390 C640,390 630,455 670,455"/>
+        <path class="edge red" id="e-fraud-alerts" d="M850,100 C875,100 875,45 900,45"/>
+        <path class="edge red" id="e-alerts-am" d="M1060,45 L1110,45"/>
+        <path class="edge purple" id="e-fraud-dec" d="M850,140 C875,140 875,155 900,155"/>
+        <path class="edge purple" id="e-dec-sink" d="M1060,155 L1110,155"/>
+        <path class="edge green" id="e-decsink-ice" d="M1200,190 L1200,232"/>
+        <path class="edge green" id="e-sink-ice" d="M850,455 C925,455 925,470 1000,470"/>
+      </g>
+
+      <g class="node" data-stage="client" transform="translate(20,255)">
+        <rect class="box" width="120" height="90"/>
+        <text class="title" x="12" y="24">Client</text>
+        <text class="label" x="12" y="46">sending</text>
+        <text class="big" x="12" y="74" id="v-client">0/s</text>
+      </g>
+
+      <g class="node" data-stage="ingestion" id="n-ingestion" transform="translate(180,255)">
+        <rect class="box" width="150" height="90"/>
+        <text class="title" x="12" y="24">Ingestion API</text>
+        <text class="label" x="12" y="46">accepted · invalid</text>
+        <text class="value" x="12" y="68" id="v-ingest">0 · 0</text>
+        <text class="label" x="12" y="84" id="v-ingest-rate">0 accepted/s</text>
+      </g>
+
+      <g class="node" data-stage="kafka" transform="translate(380,150)">
+        <rect class="box" width="230" height="290"/>
+        <text class="title" x="12" y="24">Kafka · cdr-events</text>
+        <g id="chips">
+          <rect class="chip up" id="chip-1" x="12" y="36" width="64" height="22"/><text class="value" x="22" y="51" id="chip-t-1">broker 1</text>
+          <rect class="chip up" id="chip-2" x="83" y="36" width="64" height="22"/><text class="value" x="93" y="51" id="chip-t-2">broker 2</text>
+          <rect class="chip up" id="chip-3" x="154" y="36" width="64" height="22"/><text class="value" x="164" y="51" id="chip-t-3">broker 3</text>
+        </g>
+        <g id="lanes">
+          <rect class="lane" id="lane-0" x="10" y="75" width="210" height="50"/>
+          <text class="value" x="20" y="96" id="lane-t-0">P0</text><text class="label" x="20" y="114" id="lane-s-0">…</text>
+          <rect class="lane" id="lane-1" x="10" y="145" width="210" height="50"/>
+          <text class="value" x="20" y="166" id="lane-t-1">P1</text><text class="label" x="20" y="184" id="lane-s-1">…</text>
+          <rect class="lane" id="lane-2" x="10" y="215" width="210" height="50"/>
+          <text class="value" x="20" y="236" id="lane-t-2">P2</text><text class="label" x="20" y="254" id="lane-s-2">…</text>
+        </g>
+        <text id="offline" x="12" y="282" visibility="hidden">cluster not answering</text>
+      </g>
+
+      <g class="node" data-stage="fraud" id="n-fraud" transform="translate(670,70)">
+        <rect class="box" width="180" height="100"/>
+        <text class="title" x="12" y="24">Fraud detection ×2</text>
+        <text class="label" x="12" y="46">clean · fraud</text>
+        <text class="value" x="12" y="66" id="v-fraud">0 · 0</text>
+        <text class="label" x="12" y="88" id="v-fraud-lag">lag 0</text>
+      </g>
+
+      <g class="node" data-stage="alerts" id="n-alerts" transform="translate(900,10)">
+        <rect class="box" width="160" height="70"/>
+        <text class="title" x="12" y="24">Postgres alerts</text>
+        <text class="value" x="12" y="48" id="v-alerts">0 stored</text>
+        <text class="label" x="12" y="64" id="v-dupes">0 duplicates ignored</text>
+      </g>
+
+      <g class="node" data-stage="alertmanager" id="n-am" transform="translate(1110,10)">
+        <rect class="box" width="190" height="70"/>
+        <text class="title" x="12" y="24">Alertmanager</text>
+        <text class="value" x="12" y="48" id="v-am">0 notifications</text>
+        <text class="label" x="12" y="64">sent in the background</text>
+      </g>
+
+      <g class="node" data-stage="decisions" id="n-dec" transform="translate(900,120)">
+        <rect class="box" width="160" height="70"/>
+        <text class="title" x="12" y="24">Kafka · fraud-decisions</text>
+        <text class="value" x="12" y="48" id="v-dec">0 decisions</text>
+        <text class="label" x="12" y="64">every CDR, fraud or not</text>
+      </g>
+
+      <g class="node" data-stage="decisions_sink" id="n-decsink" transform="translate(1110,120)">
+        <rect class="box" width="190" height="70"/>
+        <text class="title" x="12" y="24">Sink · fraud_decisions</text>
+        <rect class="bar-bg" x="12" y="36" width="166" height="12"/>
+        <rect class="bar" id="bar-dec" x="12" y="36" width="0" height="12"/>
+        <text class="label" x="12" y="64" id="v-decsink">0 buffered</text>
+      </g>
+
+      <g class="node" data-stage="iceberg_decisions" id="n-ice-dec" transform="translate(1110,232)">
+        <rect class="box" width="190" height="110"/>
+        <text class="title" x="12" y="24">Iceberg · fraud_decisions</text>
+        <text class="big" x="12" y="54" id="v-ice-dec-rows">–</text>
+        <text class="label" x="12" y="74" id="v-ice-dec-files">files –</text>
+        <text class="label" x="12" y="94" id="v-ice-dec-snap">last commit –</text>
+      </g>
+
+      <g class="node" data-stage="cdr_sink" id="n-sink" transform="translate(670,400)">
+        <rect class="box" width="180" height="110"/>
+        <text class="title" x="12" y="24">Sink · cdr_events</text>
+        <text class="label" x="12" y="44">batch (500 rows or 10 s)</text>
+        <rect class="bar-bg" x="12" y="52" width="156" height="14"/>
+        <rect class="bar" id="bar-cdr" x="12" y="52" width="0" height="14"/>
+        <text class="label" x="12" y="86" id="v-sink">0 buffered</text>
+        <text class="label" x="12" y="102" id="v-sink-lag">lag 0</text>
+      </g>
+
+      <g class="node" data-stage="iceberg_cdr" id="n-ice-cdr" transform="translate(1000,400)">
+        <rect class="box" width="300" height="210"/>
+        <text class="title" x="12" y="24">Iceberg · cdr_events</text>
+        <text class="big" x="12" y="54" id="v-ice-cdr-rows">–</text>
+        <text class="label" x="150" y="54" id="v-ice-cdr-files">files –</text>
+        <text class="label" x="12" y="76">latest snapshots (Kafka offsets stored inside)</text>
+        <g id="snaps"></g>
+      </g>
+
+      <g id="particles"></g>
+      <g id="trace-layer"></g>
+    </svg>
+  </div>
+
+  <aside>
+    <div class="card" id="trace-card">
+      <h2>Follow one CDR</h2>
+      <div class="row">
+        <button id="trace-normal">Normal CDR</button>
+        <button id="trace-suspicious" class="danger">Suspicious CDR</button>
+      </div>
+      <div class="small" id="trace-id">Sends one record and moves a yellow dot through each stage as that stage confirms it. Clearest with traffic stopped.</div>
+      <ol id="trace-steps"></ol>
+    </div>
+    <div class="card">
+      <h2>Traffic</h2>
+      <div class="row">
+        <button data-rate="5">5/s</button><button data-rate="10">10/s</button>
+        <button data-rate="25">25/s</button><button id="stop">Stop</button>
+      </div>
+      <div class="small" id="traffic-stats" style="margin-top:6px">stopped</div>
+    </div>
+    <div class="card">
+      <h2>Send one CDR</h2>
+      <div class="row">
+        <button id="send-valid">Valid CDR</button>
+        <button id="send-invalid" class="danger">Invalid CDR (bad IMEI)</button>
+      </div>
+      <div class="result" id="send-result"></div>
+    </div>
+    <div class="card">
+      <h2>Kafka brokers</h2>
+      <div id="brokers"></div>
+      <div class="small">Kill sends SIGKILL to the container. Kill a broker that leads partitions to watch leadership move. With one broker down, writes go on; with two down, the API refuses writes rather than store one copy.</div>
+    </div>
+    <div class="card">
+      <h2>Table maintenance</h2>
+      <button id="compact">Compact now</button>
+      <div class="result" id="compact-result"></div>
+    </div>
+  </aside>
+</main>
+
+<div id="bottom">
+  <div class="card" id="explain">
+    <h3>Click any stage in the diagram</h3>
+    <p>Each box is a stage of the pipeline. Dots are records moving between stages, driven by what the services report every second.</p>
+  </div>
+  <div class="card">
+    <h2>Live events</h2>
+    <ul id="log"></ul>
+  </div>
+</div>
+
+<script>
+const EXPLAIN = {
+  client: ["Client", "Stands in for the operator's systems. It posts call detail records (CDRs) to the ingestion API, a batch every second at the rate you choose. A rejected CDR would be sent again by a real client."],
+  ingestion: ["Ingestion API", "Validates each CDR (field types, phone number, 15-digit IMEI, risk score), adds a processing timestamp, encodes it with the <code>cdr-events</code> Avro contract from the schema registry, and sends it to Kafka keyed by customer. It answers 202 only after two brokers have stored the record; otherwise 503, so the client retries."],
+  kafka: ["Kafka · cdr-events", "Three brokers, three partitions, every partition stored on all three brokers. A write is confirmed once two copies exist (<code>min.insync.replicas=2</code>). The leader handles a partition's writes; ISR lists the replicas that are up to date. Kill a broker: its partitions get a new leader and the ISR drops to 2, but writes go on."],
+  fraud: ["Fraud detection", "Two replicas share the partitions as one consumer group. Each CDR: decode with its contract, then rules, then a random forest, then an LLM for uncertain cases (falling back to the model score). A CDR is marked done only after its alert and decision are stored, so a crash means it is processed again, never skipped."],
+  alerts: ["Postgres alerts", "Fraud alerts are inserted with <code>transaction_id</code> as primary key and <code>ON CONFLICT DO NOTHING</code>, so a CDR processed twice creates one alert. Analysts list and close alerts through the fraud-detection API."],
+  alertmanager: ["Alertmanager", "New alerts are queued and sent from a background thread with short timeouts, so a slow or missing Alertmanager never slows detection (it once cut throughput from 217 to 15 CDRs per 20 s)."],
+  decisions: ["Kafka · fraud-decisions", "Every decision, fraud or clean, is published as an event with its own Avro contract, including the CDR's original partition and offset. A second dataset onboarded with a contract and a sink file, no new sink code."],
+  decisions_sink: ["Sink · fraud_decisions", "The same sink code as for CDRs, run with a different sink file. It buffers decisions and commits them to Iceberg in batches."],
+  iceberg_decisions: ["Iceberg · fraud_decisions", "Every decision, partitioned by day like the CDRs, so they can be joined per day. A Trino view keeps the latest decision per transaction."],
+  cdr_sink: ["Sink · cdr_events", "Reads cdr-events as its own consumer group and buffers rows until 500 or 10 seconds, because every commit writes new files. On commit it appends the Parquet data and the Kafka offsets (and topic id) in one Iceberg snapshot, so a crash can neither lose nor duplicate a row. On restart it seeks to the offsets in Iceberg, not Kafka's."],
+  iceberg_cdr: ["Iceberg · cdr_events", "Parquet files in SeaweedFS (S3), registered in the Lakekeeper catalog, partitioned by day. Each snapshot is a version of the table; the cards show the latest ones with the Kafka offsets stored inside. Compaction merges small files without changing a row; Trino and DuckDB query it."],
+};
+
+const $ = (id) => document.getElementById(id);
+const svg = $("svg"), layer = $("particles");
+const NS = "http://www.w3.org/2000/svg";
+const fmt = (n) => (n == null ? "–" : Math.round(n).toLocaleString());
+
+// ---- particle engine ---------------------------------------------------------
+const edges = {};
+document.querySelectorAll("#edges path").forEach((p) => { edges[p.id] = { path: p, len: p.getTotalLength() }; });
+const particles = [];
+const MAX_PARTICLES = 450;
+
+function emit(edgeId, count, color, opts = {}) {
+  const edge = edges[edgeId];
+  if (!edge || count <= 0) return;
+  const dots = Math.min(Math.round(count), opts.max || 20);
+  const spread = opts.spread ?? 900;
+  for (let i = 0; i < dots; i++) {
+    if (particles.length >= MAX_PARTICLES) return;
+    particles.push({ edge, color, start: performance.now() + (spread * i) / dots + (opts.delay || 0),
+                     duration: opts.duration || 700, r: opts.r || 3.2, el: null });
+  }
+}
+
+function packet(edgeId, rows, color) {
+  const edge = edges[edgeId];
+  if (!edge || rows <= 0) return;
+  const g = document.createElementNS(NS, "g");
+  const rect = document.createElementNS(NS, "rect");
+  rect.setAttribute("class", "packet"); rect.setAttribute("rx", 6);
+  rect.setAttribute("width", 74); rect.setAttribute("height", 22); rect.setAttribute("x", -37); rect.setAttribute("y", -11);
+  rect.style.fill = color;
+  const text = document.createElementNS(NS, "text");
+  text.setAttribute("class", "packet-text"); text.setAttribute("text-anchor", "middle"); text.setAttribute("y", 4);
+  text.textContent = `+${fmt(rows)} rows`;
+  g.append(rect, text);
+  layer.appendChild(g);
+  particles.push({ edge, el: g, packet: true, start: performance.now(), duration: 1300 });
+}
+
+function frame(now) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    const t = (now - p.start) / p.duration;
+    if (t < 0) continue;
+    if (!p.el) {
+      p.el = document.createElementNS(NS, "circle");
+      p.el.setAttribute("r", p.r); p.el.setAttribute("fill", p.color);
+      layer.appendChild(p.el);
+    }
+    if (t >= 1) { p.el.remove(); particles.splice(i, 1); continue; }
+    const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    const pt = p.edge.path.getPointAtLength(eased * p.edge.len);
+    if (p.packet) p.el.setAttribute("transform", `translate(${pt.x},${pt.y})`);
+    else { p.el.setAttribute("cx", pt.x); p.el.setAttribute("cy", pt.y); }
+  }
+  traceFrame(now);
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function flash(id, cls = "flash") {
+  const el = $(id); if (!el) return;
+  el.classList.remove(cls); void el.getBBox(); el.classList.add(cls);
+  setTimeout(() => el.classList.remove(cls), 900);
+}
+
+// ---- following one CDR ------------------------------------------------------------
+// Each dot moves one edge at a time, and only once the backend has confirmed the step
+// that edge stands for. After Kafka the record goes two ways at once (fraud detection
+// and the CDR sink), and a fraud decision adds a third (the alert), so a branch waits
+// until the main dot has reached the point where it splits off. {p} is the partition.
+const TRACE_LEGS = {
+  main: [{ edge: "e-client-ing", step: "ingest" }, { edge: "e-ing-p{p}", step: "kafka" },
+         { edge: "e-p{p}-fraud", step: "decision" }, { edge: "e-fraud-dec", step: "decision" },
+         { edge: "e-dec-sink", step: "decision" }, { edge: "e-decsink-ice", step: "decision_iceberg" }],
+  sink: [{ edge: "e-p{p}-sink", step: "kafka", after: "main:1" }, { edge: "e-sink-ice", step: "cdr_iceberg" }],
+  alert: [{ edge: "e-fraud-alerts", step: "alert", after: "main:2" }, { edge: "e-alerts-am", step: "alert" }],
+};
+const TRACE_STEPS = [["ingest", "Ingestion API"], ["kafka", "Kafka · cdr-events"], ["decision", "Fraud detection"],
+                     ["alert", "Fraud alert"], ["cdr_iceberg", "Iceberg · cdr_events"],
+                     ["decision_iceberg", "Iceberg · fraud_decisions"]];
+const traceLayer = $("trace-layer");
+let tracer = null;
+
+function startTracer(trace) {
+  traceLayer.innerHTML = "";
+  const tokens = {};
+  for (const [name, legs] of Object.entries(TRACE_LEGS)) {
+    const el = document.createElementNS(NS, "g");
+    el.setAttribute("class", "trace-token");
+    el.innerHTML = `<circle class="trace-halo" r="13"/><circle r="6.5" style="fill: var(--trace)" stroke="#04111f" stroke-width="2"/>`
+      + (name === "main" ? `<text class="trace-label" x="11" y="-11">${trace.transaction_id}</text>` : "");
+    el.style.display = name === "main" ? "" : "none";
+    traceLayer.appendChild(el);
+    tokens[name] = { name, legs, i: 0, moving: null, el };
+  }
+  const start = edges["e-client-ing"].path.getPointAtLength(0);
+  tokens.main.el.setAttribute("transform", `translate(${start.x},${start.y})`);
+  tracer = { id: trace.transaction_id, trace, tokens, reached: new Set() };
+}
+
+function traceFrame(now) {
+  if (!tracer) return;
+  for (const tok of Object.values(tracer.tokens)) {
+    if (tok.moving) {
+      const t = Math.min(1, (now - tok.moving.start) / 1100);
+      const eased = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+      const pt = tok.moving.edge.path.getPointAtLength(eased * tok.moving.edge.len);
+      tok.el.setAttribute("transform", `translate(${pt.x},${pt.y})`);
+      if (t >= 1) { tracer.reached.add(`${tok.name}:${tok.i}`); tok.i++; tok.moving = null; }
+      continue;
+    }
+    const leg = tok.legs[tok.i];
+    if (!leg) continue;
+    const step = tracer.trace.steps[leg.step];
+    if (step.status === "failed") tok.el.classList.add("failed");
+    if (step.status !== "done" || (leg.after && !tracer.reached.has(leg.after))) continue;
+    const edge = edges[leg.edge.replace("{p}", tracer.trace.partition)];
+    if (!edge) continue;
+    tok.moving = { edge, start: now };
+    tok.el.style.display = "";
+  }
+}
+
+function renderTrace(trace) {
+  if (!trace) return;
+  // a trace that ended long before the page was opened is listed, not replayed
+  const stale = !tracer && trace.finished && Date.now() / 1000 - trace.started > 120;
+  if (!stale && (!tracer || tracer.id !== trace.transaction_id)) startTracer(trace);
+  if (tracer && tracer.id === trace.transaction_id) tracer.trace = trace;
+  $("trace-normal").disabled = $("trace-suspicious").disabled = !trace.finished;
+  $("trace-id").innerHTML = `<b>${trace.transaction_id}</b> · customer ${trace.customer_id} · €${trace.amount_eur}`;
+  $("trace-steps").innerHTML = TRACE_STEPS.map(([key, label]) => {
+    const s = trace.steps[key];
+    const icon = { waiting: "◌", done: "✓", failed: "✗", skipped: "–" }[s.status];
+    const after = s.after != null ? `<span class="small"> · +${s.after} s</span>` : "";
+    return `<li class="${s.status}"><span class="ic">${icon}</span><div><b>${label}</b>${after}<div class="small">${s.text}</div></div></li>`;
+  }).join("");
+}
+
+// ---- reading the state and animating the differences ----------------------------
+let prev = null;
+function delta(name, s) { return prev ? Math.max(0, (s[name] || 0) - (prev.stages[name] || 0)) : 0; }
+
+// split a stage's total over the three partitions, in proportion to what each just received
+function distribute(total, weights) {
+  const sum = weights.reduce((a, b) => a + b, 0);
+  return weights.map((w) => (sum ? (total * w) / sum : total / weights.length));
+}
+
+function render(state) {
+  const s = state.stages;
+  // the last Kafka reading; parts of it may be stale while a broker is down
+  const k = state.kafka && state.kafka.partitions && state.kafka.partitions["cdr-events"] ? state.kafka : null;
+  const brokerState = (b) => {
+    const running = state.containers?.[b] === "running";
+    const inCluster = (state.kafka?.brokers_alive || []).includes(b);
+    return !running ? "down" : inCluster ? "up" : "joining";
+  };
+
+  // client -> ingestion
+  const dAccepted = delta("ingested", s), dInvalid = delta("invalid", s), dFailed = delta("publish_failed", s);
+  emit("e-client-ing", dAccepted, "var(--ingest)");
+  emit("e-client-ing", dInvalid + dFailed, "var(--fraud)", { max: 6 });
+  if (dInvalid + dFailed > 0) flash("n-ingestion", "shake");
+  $("v-client").textContent = `${state.traffic.rate}/s`;
+  $("v-ingest").textContent = `${fmt(s.ingested)} · ${fmt(s.invalid)}`;
+  $("v-ingest-rate").textContent = `${fmt(dAccepted)} accepted/s`;
+
+  // ingestion -> partitions (real per-partition offset growth)
+  let produced = [0, 0, 0];
+  if (k) {
+    const parts = k.partitions["cdr-events"];
+    if (prev && prev.kafka) {
+      produced = parts.map((p, i) => Math.max(0, p.end - (prev.kafka.partitions["cdr-events"][i]?.end ?? p.end)));
+    }
+    produced.forEach((n, i) => emit(`e-ing-p${i}`, n, "var(--ingest)", { delay: 250 }));
+    parts.forEach((p, i) => {
+      const isr = p.isr.length;
+      const lane = $(`lane-${i}`);
+      lane.classList.toggle("down", p.leader == null || isr < 2);
+      lane.classList.toggle("degraded", p.leader != null && isr === 2);
+      $(`lane-t-${i}`).textContent = `P${i}  ·  leader broker ${p.leader ?? "none"}`;
+      $(`lane-s-${i}`).textContent = `in sync ${isr}/3 [${p.isr.join(",")}]  ·  offset ${fmt(p.end)}`;
+      if (prev && prev.kafka && prev.kafka.partitions["cdr-events"][i]?.leader !== p.leader) flash(`lane-${i}`);
+    });
+    const lag = (group, topic) => k.partitions[topic].reduce((a, p) => a + Math.max(0, p.end - (k.groups[group]?.[p.partition] ?? 0)), 0);
+    $("v-fraud-lag").textContent = `lag ${fmt(lag("fraud-detection", "cdr-events"))}  ·  decisions topic ${fmt(k.partitions["fraud-decisions"].reduce((a, p) => a + p.end, 0))}`;
+    $("v-sink-lag").textContent = `lag ${fmt(lag("lakehouse-writer", "cdr-events"))}`;
+    $("v-dec").textContent = `${fmt(k.partitions["fraud-decisions"].reduce((a, p) => a + p.end, 0))} decisions`;
+  }
+  $("offline").setAttribute("visibility", state.kafka?.ok ? "hidden" : "visible");
+  for (const b of [1, 2, 3]) $(`chip-${b}`).setAttribute("class", "chip " + brokerState(b));
+
+  // partitions -> fraud detection; fraud -> alerts / decisions
+  const weights = produced.some((n) => n > 0) ? produced : [1, 1, 1];
+  const dClean = delta("clean", s), dFraud = delta("fraud", s);
+  distribute(dClean, weights).forEach((n, i) => emit(`e-p${i}-fraud`, n, "var(--clean)", { delay: 450 }));
+  distribute(dFraud, weights).forEach((n, i) => emit(`e-p${i}-fraud`, n, "var(--fraud)", { delay: 450, r: 4 }));
+  emit("e-fraud-alerts", dFraud, "var(--fraud)", { delay: 1100, r: 4 });
+  emit("e-alerts-am", delta("notifications", s), "var(--fraud)", { delay: 1500, r: 4 });
+  emit("e-fraud-dec", delta("decisions", s), "var(--decision)", { delay: 1100 });
+  if (dFraud > 0) flash("n-alerts");
+  $("v-fraud").textContent = `${fmt(s.clean)} · ${fmt(s.fraud)}`;
+  $("v-alerts").textContent = `${fmt(s.fraud)} fraud found`;
+  $("v-dupes").textContent = `${fmt(s.duplicate_alerts)} duplicates ignored`;
+  $("v-am").textContent = `${fmt(s.notifications)} notifications`;
+
+  // partitions -> cdr sink buffer -> iceberg
+  const dCdrAppended = delta("cdr_appended", s);
+  const cdrRead = dCdrAppended + Math.max(0, s.cdr_buffered - (prev ? prev.stages.cdr_buffered : s.cdr_buffered));
+  distribute(cdrRead, weights).forEach((n, i) => emit(`e-p${i}-sink`, n, "var(--ingest)", { delay: 450 }));
+  $("bar-cdr").setAttribute("width", Math.min(156, (156 * s.cdr_buffered) / 500));
+  $("v-sink").textContent = `${fmt(s.cdr_buffered)} rows buffered  ·  ${fmt(s.cdr_appended)} committed`;
+  if (dCdrAppended > 0) { packet("e-sink-ice", dCdrAppended, "var(--data)"); setTimeout(() => flash("n-ice-cdr"), 1200); }
+
+  const dDecAppended = delta("decisions_appended", s);
+  const decRead = dDecAppended + Math.max(0, s.decisions_buffered - (prev ? prev.stages.decisions_buffered : s.decisions_buffered));
+  emit("e-dec-sink", decRead, "var(--decision)", { delay: 1400 });
+  $("bar-dec").setAttribute("width", Math.min(166, (166 * s.decisions_buffered) / 500));
+  $("v-decsink").textContent = `${fmt(s.decisions_buffered)} buffered  ·  ${fmt(s.decisions_appended)} committed`;
+  if (dDecAppended > 0) { emit("e-decsink-ice", 8, "var(--data)", { r: 4, spread: 300 }); setTimeout(() => flash("n-ice-dec"), 600); }
+
+  // iceberg tables
+  const cdr = state.tables?.cdr_events, dec = state.tables?.fraud_decisions;
+  if (cdr) {
+    $("v-ice-cdr-rows").textContent = `${fmt(cdr.rows)} rows`;
+    const snaps = $("snaps"); snaps.innerHTML = "";
+    cdr.snapshots.slice(0, 4).forEach((sn, i) => {
+      const y = 88 + i * 29;
+      const r = document.createElementNS(NS, "rect");
+      r.setAttribute("class", "snap" + (sn.operation === "append" ? "" : " maint"));
+      r.setAttribute("x", 12); r.setAttribute("y", y); r.setAttribute("width", 276); r.setAttribute("height", 24);
+      const t = document.createElementNS(NS, "text");
+      t.setAttribute("class", "value"); t.setAttribute("x", 20); t.setAttribute("y", y + 16); t.style.fontSize = "11px";
+      const offsets = sn.offsets ? Object.entries(sn.offsets).sort().map(([p, o]) => `${p}:${o}`).join(" ") : "";
+      t.textContent = sn.operation === "append" ? `${sn.time}  +${sn.added}  offsets ${offsets}` : `${sn.time}  ${sn.operation} (maintenance)`;
+      snaps.append(r, t);
+    });
+  }
+  $("v-ice-cdr-files").textContent = `files ${fmt(s.cdr_files)}`;
+  if (dec) {
+    $("v-ice-dec-rows").textContent = `${fmt(dec.rows)} rows`;
+    const last = dec.snapshots[0];
+    $("v-ice-dec-snap").textContent = last ? `last commit ${last.time} (${last.operation})` : "no commits yet";
+  }
+  $("v-ice-dec-files").textContent = `files ${fmt(s.decisions_files)}`;
+
+  // side panel
+  document.querySelectorAll("[data-rate]").forEach((b) => b.classList.toggle("active", +b.dataset.rate === state.traffic.rate));
+  const t = state.traffic;
+  $("traffic-stats").textContent = `${t.rate ? t.rate + "/s" : "stopped"}  ·  accepted ${fmt(t.accepted)}, rejected ${fmt(t.rejected)}`
+    + `, sent again ${fmt(t.retried)}` + (t.pending ? `, ${fmt(t.pending)} waiting to be sent again` : "");
+  $("brokers").innerHTML = [1, 2, 3].map((b) => {
+    const running = state.containers?.[b] === "running";
+    const label = { up: '<span class="ok">● in cluster</span>', joining: '<span class="info">● rejoining…</span>',
+                    down: '<span class="bad">● down</span>' }[brokerState(b)];
+    const leads = (k?.partitions["cdr-events"] || []).filter((p) => p.leader === b).map((p) => "P" + p.partition);
+    const leadText = leads.length ? `<span class="small"> · leads ${leads.join(", ")}</span>` : "";
+    return `<div class="broker"><span>Broker ${b} ${label}${leadText}</span>
+      <button class="danger" data-broker="${b}" data-action="kill" ${running ? "" : "disabled"}>Kill</button>
+      <button data-broker="${b}" data-action="start" ${running ? "disabled" : ""}>Start</button></div>`;
+  }).join("");
+  const c = state.compaction;
+  $("compact").disabled = c.running;
+  $("compact-result").innerHTML = c.running ? '<span class="info">compacting…</span>'
+    : c.result?.error ? `<span class="bad">${c.result.error}</span>`
+    : c.result ? Object.entries(c.result).map(([t, r]) => `<div class="ok">${t}: ${fmt(r.before)} → ${fmt(r.after)} files, rows ${fmt(r.rows_before)} → ${fmt(r.rows_after)}</div>`).join("") : "";
+  renderTrace(state.trace);
+  $("log").innerHTML = state.events.map((e) => `<li class="${e.kind}"><span class="t">${e.time}</span>${e.text}</li>`).join("");
+
+  prev = state;
+}
+
+async function poll() {
+  try {
+    const state = await (await fetch("/api/state")).json();
+    if (state.stages) {
+      render(state);
+      $("status").innerHTML = `<span class="dot"></span>live · updated ${new Date(state.updated * 1000).toLocaleTimeString()}`;
+    }
+  } catch (e) {
+    $("status").innerHTML = `<span class="dot" style="background:var(--fraud)"></span>console backend not answering`;
+  }
+  setTimeout(poll, 1000);
+}
+poll();
+
+// ---- controls and explanations ----------------------------------------------------
+const post = (url) => fetch(url, { method: "POST" }).then((r) => r.json());
+document.querySelectorAll("[data-rate]").forEach((b) => b.onclick = () => post(`/api/traffic/start?rate=${b.dataset.rate}`));
+$("stop").onclick = () => post("/api/traffic/stop");
+async function send(kind) {
+  const r = await post(`/api/send/${kind}`);
+  $("send-result").innerHTML = `<span class="${r.status === 202 ? "ok" : "bad"}">HTTP ${r.status}: ${r.detail}</span>`;
+}
+$("send-valid").onclick = () => send("valid");
+$("send-invalid").onclick = () => send("invalid");
+$("brokers").onclick = (e) => {
+  const b = e.target.closest("button[data-broker]");
+  if (b) post(`/api/broker/${b.dataset.broker}/${b.dataset.action}`);
+};
+$("compact").onclick = () => post("/api/compact");
+async function follow(kind) {
+  $("trace-normal").disabled = $("trace-suspicious").disabled = true;
+  const trace = await post(`/api/trace/${kind}`);
+  if (trace.transaction_id) renderTrace(trace);
+}
+$("trace-normal").onclick = () => follow("normal");
+$("trace-suspicious").onclick = () => follow("suspicious");
+document.querySelectorAll(".node").forEach((n) => n.onclick = () => {
+  document.querySelectorAll(".node").forEach((x) => x.classList.remove("selected"));
+  n.classList.add("selected");
+  const [title, text] = EXPLAIN[n.dataset.stage];
+  $("explain").innerHTML = `<h3>${title}</h3><p>${text}</p>`;
+});
+</script>
+</body>
+</html>

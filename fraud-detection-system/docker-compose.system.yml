@@ -33,10 +33,14 @@ x-kafka-env: &kafka-env
   KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
   KAFKA_HEAP_OPTS: -Xmx512m -Xms512m
 
+# The check runs a Kafka CLI tool, a JVM of its own: give it a small heap instead of the
+# broker's 512 MB, and time to finish. On a busy laptop it took over 10 s, and healthy
+# brokers were marked unhealthy, which stopped Compose from starting their dependants.
 x-kafka-healthcheck: &kafka-healthcheck
-  test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
-  interval: 10s
-  timeout: 10s
+  test: ["CMD-SHELL", "KAFKA_HEAP_OPTS='-Xms32m -Xmx64m' /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 > /dev/null 2>&1"]
+  interval: 15s
+  timeout: 30s
+  start_period: 30s
   retries: 10
 
 # the Lakekeeper catalog server and its migration job
@@ -634,6 +638,34 @@ services:
     depends_on:
       lakekeeper-init:
         condition: service_completed_successfully
+    networks:
+      - fraud-detection-network
+    restart: unless-stopped
+
+  # Demo console (http://localhost:8090): the pipeline animated live, with controls to send
+  # traffic, kill and restart brokers, and compact. Only started with the demo profile:
+  #   docker compose -f docker-compose.system.yml --profile demo up -d demo-console
+  # It needs the Docker socket and can only stop and start the three brokers and run
+  # compaction in the maintenance container; never run it outside a local demo.
+  demo-console:
+    build: ./demo-console/
+    container_name: demo_console_1
+    profiles: ["demo"]
+    ports:
+      - "8090:8090"
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: *kafka-bootstrap
+      INGESTION_URL: http://cdr-ingestion:8080
+      TRINO_URL: http://trino:8080
+      ML_URL: http://ml-service:8001
+      SCHEMA_REGISTRY_URL: http://schema-registry:8081
+      DATASET: /data/telecom_fraud_dataset.json
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./cdr-ingestion/app/telecom_fraud_dataset.json:/data/telecom_fraud_dataset.json:ro
+    depends_on:
+      cdr-ingestion:
+        condition: service_started
     networks:
       - fraud-detection-network
     restart: unless-stopped
