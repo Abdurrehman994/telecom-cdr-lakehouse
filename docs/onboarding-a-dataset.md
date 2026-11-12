@@ -86,7 +86,7 @@ maintenance:
 
 Unknown keys, a column the contract does not have, or a transform that does not fit the column type stop the writer at startup with an error naming the problem.
 
-Then add a writer for it to `docker-compose.system.yml`, a copy of `lakehouse-writer-fraud-decisions` with the sink file changed, and add it to the `lakehouse-writer` scrape job in `monitoring/prometheus/prometheus.yml`. `lakehouse-maintenance` picks up every sink file by itself.
+On Kubernetes, add an entry to `sinks` in `k8s/chart/values.yaml` (name, topic, sink file) and add the topic as a `KafkaTopic` in `k8s/kafka.yaml`; the chart creates the Deployment. With Compose, add a writer for it to `docker-compose.system.yml`, a copy of `lakehouse-writer-fraud-decisions` with the sink file changed, and add it to the `lakehouse-writer` scrape job in `monitoring/prometheus/prometheus.yml`. `lakehouse-maintenance` picks up every sink file by itself.
 
 ## What you get
 

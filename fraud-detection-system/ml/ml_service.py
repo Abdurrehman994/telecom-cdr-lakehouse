@@ -10,7 +10,7 @@ from typing import Dict, List, Literal, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from prometheus_client import Counter, Histogram, generate_latest, REGISTRY
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.preprocessing import LabelEncoder
 from confluent_kafka import Consumer, Producer, KafkaError, KafkaException
@@ -344,14 +344,20 @@ class AlertStore:
         )
 
     def open(self):
-        """connect to postgres, retrying until it is up"""
+        """connect to postgres, waiting until it is up.
+
+        the pool is opened once and keeps connecting in the background; a pool cannot be
+        opened twice, so a slow database is waited for, not retried with a new open()
+        (that raised, and silently stopped the consumer when postgres started late)
+        """
+        self.pool.open()
         while True:
             try:
-                self.pool.open(wait=True, timeout=10)
+                self.pool.wait(timeout=10)
                 print("connected to postgres alert store")
                 return
             except PoolTimeout as e:
-                print(f"postgres not ready ({e}), retrying...")
+                print(f"postgres not ready ({e}), still waiting...")
 
     def save(self, cdr: Dict, result: Dict, partition: int, offset: int) -> bool:
         """insert the alert; returns True if it is new, False if it already existed"""
@@ -662,8 +668,9 @@ class CDRConsumer:
         """ask the poll loop to finish"""
         self.running = False
 
-# global consumer instance
+# global consumer instance, and the thread it runs in (watched by /health)
 consumer = None
+consumer_thread = None
 
 def send_alert_to_prometheus(cdr: Dict, detection_result: Dict):
     """Send alert to Prometheus Alertmanager"""
@@ -753,7 +760,7 @@ notifier = AlertNotifier()
 @app.on_event("startup")
 async def startup_event():
     """start kafka consumer on startup"""
-    global consumer
+    global consumer, consumer_thread
 
     consumer = CDRConsumer()
     notifier.start()
@@ -818,7 +825,11 @@ def update_alert(transaction_id: str, update: AlertUpdate):
 
 @app.get("/health")
 async def health():
-    """health check endpoint"""
+    """healthy while the kafka consumer thread runs; 503 otherwise, so the container is restarted"""
+    if consumer_thread is not None and not consumer_thread.is_alive():
+        return JSONResponse(status_code=503,
+                            content={"status": "unhealthy", "service": "ml-fraud-detection",
+                                     "reason": "kafka consumer stopped"})
     return {"status": "healthy", "service": "ml-fraud-detection"}
 
 @app.get("/metrics")

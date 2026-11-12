@@ -1,0 +1,10 @@
+apiVersion: v2
+name: data-platform
+description: >-
+  The streaming data platform on Kubernetes: schema registry and data contracts,
+  SeaweedFS object storage, the Lakekeeper Iceberg catalog, one lakehouse sink per
+  dataset, table maintenance, and the fraud detection workload. Kafka itself is run
+  by the Strimzi operator (k8s/kafka.yaml).
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

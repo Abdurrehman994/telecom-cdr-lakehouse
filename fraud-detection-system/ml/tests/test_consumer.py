@@ -351,3 +351,45 @@ def test_notifications_beyond_the_queue_are_dropped_and_counted():
     assert notifier.queue.qsize() == 2
     assert dropped._value.get() == before + 3
 
+
+class FakePool:
+    """a psycopg pool that is opened once and becomes ready after some waits"""
+
+    def __init__(self, timeouts):
+        self.timeouts = timeouts
+        self.opened = 0
+
+    def open(self):
+        if self.opened:
+            raise psycopg.OperationalError("pool has already been opened/closed and cannot be reused")
+        self.opened += 1
+
+    def wait(self, timeout):
+        if self.timeouts:
+            self.timeouts -= 1
+            raise ml_service.PoolTimeout("pool initialization incomplete after 10 sec")
+
+
+def test_a_late_database_is_waited_for_without_reopening_the_pool():
+    """Regression: a second open() raised and silently stopped the consumer when postgres started late."""
+    store = ml_service.AlertStore.__new__(ml_service.AlertStore)
+    store.pool = FakePool(timeouts=3)
+
+    store.open()
+
+    assert store.pool.opened == 1 and store.pool.timeouts == 0
+
+
+def test_health_fails_once_the_consumer_thread_has_stopped(monkeypatch):
+    from fastapi.testclient import TestClient
+
+    client = TestClient(ml_service.app)
+    stopped = threading.Thread(target=lambda: None)
+    stopped.start()
+    stopped.join()
+
+    monkeypatch.setattr(ml_service, "consumer_thread", None)
+    assert client.get("/health").status_code == 200
+    monkeypatch.setattr(ml_service, "consumer_thread", stopped)
+    assert client.get("/health").status_code == 503
+

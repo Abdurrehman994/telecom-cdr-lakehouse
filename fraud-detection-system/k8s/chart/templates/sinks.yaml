@@ -1,0 +1,70 @@
+# One writer per sink: each streams a topic into an Iceberg table, as its own consumer
+# group, with exactly-once commits. A dataset is onboarded by adding an entry to
+# .Values.sinks (and its contract and sink file), not by writing a new service.
+{{- range .Values.sinks }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sink-{{ .name }}
+  labels:
+    {{- include "platform.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: lakehouse-sink
+spec:
+  # one writer per table: the exactly-once offset merge assumes a single writer
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {app: sink-{{ .name }}}
+  template:
+    metadata:
+      labels:
+        app: sink-{{ .name }}
+        app.kubernetes.io/component: lakehouse-sink
+    spec:
+      initContainers:
+        {{- include "platform.waitFor" (dict "root" $ "name" "warehouse" "url" "http://lakekeeper:8181/catalog/v1/config?warehouse=lakehouse") | nindent 8 }}
+        {{- include "platform.waitFor" (dict "root" $ "name" "contracts" "url" (printf "http://schema-registry:8081/subjects/%s-value/versions/latest" .topic)) | nindent 8 }}
+      containers:
+        - name: writer
+          image: {{ $.Values.images.lakehouse }}
+          imagePullPolicy: {{ $.Values.images.pullPolicy }}
+          command: ["python", "-u", "writer.py", {{ .file | quote }}]
+          env:
+            {{- include "platform.lakehouseEnv" $ | nindent 12 }}
+            - {name: METRICS_PORT, value: "8002"}
+          ports: [{name: metrics, containerPort: 8002}]
+          resources:
+            requests: {memory: 256Mi, cpu: 100m}
+            limits: {memory: 768Mi}
+{{- end }}
+---
+# Table maintenance for every sink's table, as a scheduled job instead of a sleeping loop
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: lakehouse-maintenance
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  schedule: {{ .Values.maintenance.schedule | quote }}
+  # a run that is still going when the next one is due keeps going alone
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      template:
+        spec:
+          restartPolicy: Never
+          containers:
+            - name: maintenance
+              image: {{ .Values.images.lakehouse }}
+              imagePullPolicy: {{ .Values.images.pullPolicy }}
+              command: ["python", "-u", "maintenance.py", "all"]
+              env:
+                {{- include "platform.lakehouseEnv" . | nindent 16 }}
+              resources:
+                requests: {memory: 256Mi, cpu: 100m}
+                limits: {memory: 1Gi}

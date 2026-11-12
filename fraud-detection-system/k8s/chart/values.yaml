@@ -1,0 +1,45 @@
+# Images built from this repository (k8s/up.sh builds and loads them into kind)
+images:
+  lakehouse: data-platform/lakehouse:dev
+  ingestion: data-platform/cdr-ingestion:dev
+  fraudDetection: data-platform/ml-service:dev
+  schemaRegistry: confluentinc/cp-schema-registry:7.9.1
+  seaweedfs: chrislusf/seaweedfs:4.51
+  lakekeeper: quay.io/lakekeeper/catalog:v0.13.8
+  postgres: postgres:17-alpine
+  pullPolicy: IfNotPresent
+
+# Kafka run by Strimzi (k8s/kafka.yaml): <cluster>-kafka-bootstrap
+kafkaBootstrap: platform-kafka-bootstrap:9092
+
+# One Deployment per entry; the file is a sink definition in lakehouse/sinks/ (in the image).
+# Adding a dataset: a contract, a sink file, and an entry here.
+sinks:
+  - name: cdr-events
+    topic: cdr-events
+    file: sinks/cdr_events.yaml
+  - name: fraud-decisions
+    topic: fraud-decisions
+    file: sinks/fraud_decisions.yaml
+
+maintenance:
+  # compaction, snapshot expiry and orphan cleanup for every sink's table
+  schedule: "0 * * * *"
+
+fraudDetection:
+  replicas: 2
+
+storage:
+  bucket: warehouse
+  region: us-east-1
+  size: 5Gi
+
+# Development credentials. Override them (or use an external secret) anywhere else.
+secrets:
+  s3AccessKey: lakehouse
+  s3SecretKey: lakehouse-secret
+  # signs the short-lived credentials SeaweedFS's STS hands out (base64, at least 32 bytes)
+  stsSigningKey: ZGV2LW9ubHktc3RzLXNpZ25pbmcta2V5LWZvci1zZWF3ZWVkZnM=
+  lakekeeperEncryptionKey: dev-only-lakekeeper-encryption-key
+  lakekeeperDbPassword: lakekeeper-dev-password
+  alertsDbPassword: fraud-dev-password

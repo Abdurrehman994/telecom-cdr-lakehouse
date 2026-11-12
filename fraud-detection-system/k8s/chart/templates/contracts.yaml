@@ -1,0 +1,65 @@
+# Schema registry: each topic's Avro contract versions, stored in the _schemas topic
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: schema-registry}
+  template:
+    metadata:
+      labels: {app: schema-registry}
+    spec:
+      # Kubernetes would inject SCHEMA_REGISTRY_PORT=tcp://..., and the image reads every
+      # SCHEMA_REGISTRY_* variable as a setting
+      enableServiceLinks: false
+      containers:
+        - name: schema-registry
+          image: {{ .Values.images.schemaRegistry }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - {name: SCHEMA_REGISTRY_HOST_NAME, value: schema-registry}
+            - {name: SCHEMA_REGISTRY_LISTENERS, value: "http://0.0.0.0:8081"}
+            - {name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS, value: "PLAINTEXT://{{ .Values.kafkaBootstrap }}"}
+            - {name: SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR, value: "3"}
+            - {name: SCHEMA_REGISTRY_HEAP_OPTS, value: "-Xms256m -Xmx256m"}
+          ports: [{containerPort: 8081}]
+          readinessProbe:
+            httpGet: {path: /subjects, port: 8081}
+            periodSeconds: 5
+            failureThreshold: 60
+          resources:
+            requests: {memory: 384Mi, cpu: 100m}
+            limits: {memory: 640Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: schema-registry}
+  ports: [{port: 8081}]
+---
+# Registers the data contracts baked into the lakehouse image; fails (and is retried)
+# while a contract breaks its compatibility rule
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: schema-init-{{ .Release.Revision }}
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 10
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: schema-init
+          image: {{ .Values.images.lakehouse }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["python", "-m", "dataplatform.contracts", "apply", "contracts", "--wait", "600"]
+          env:
+            - {name: SCHEMA_REGISTRY_URL, value: "http://schema-registry:8081"}

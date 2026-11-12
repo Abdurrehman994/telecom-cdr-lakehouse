@@ -22,6 +22,18 @@ jobs:
       # the platform library is the API other services build on, so it is fully typed
       - run: mypy --ignore-missing-imports libs/dataplatform/dataplatform
 
+  helm-chart:
+    name: Kubernetes chart (helm lint and render)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fraud-detection-system/k8s
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: helm lint chart
+      - run: helm template platform chart --namespace data-platform > /dev/null
+
   dataplatform-tests:
     name: dataplatform tests (with a schema registry)
     runs-on: ubuntu-latest

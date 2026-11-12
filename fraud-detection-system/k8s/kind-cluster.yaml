@@ -1,0 +1,7 @@
+# Local Kubernetes cluster for the data platform: one kind node, enough for a laptop.
+# Services are reached with kubectl port-forward (see k8s/up.sh).
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: data-platform
+nodes:
+  - role: control-plane

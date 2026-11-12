@@ -1,0 +1,66 @@
+# S3-compatible object storage for the lakehouse, with STS for vended credentials
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: seaweedfs
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  serviceName: seaweedfs
+  replicas: 1
+  selector:
+    matchLabels: {app: seaweedfs}
+  template:
+    metadata:
+      labels: {app: seaweedfs}
+      annotations:
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+    spec:
+      containers:
+        - name: seaweedfs
+          image: {{ .Values.images.seaweedfs }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args:
+            - server
+            - -dir=/data
+            - -ip.bind=0.0.0.0
+            - -master.volumeSizeLimitMB=1024
+            - -s3
+            - -s3.port=8333
+            - -s3.config=/etc/seaweedfs/s3.json
+            - -s3.iam.config=/etc/seaweedfs/s3.json
+          ports:
+            - {name: s3, containerPort: 8333}
+            - {name: master, containerPort: 9333}
+          readinessProbe:
+            httpGet: {path: /cluster/status, port: 9333}
+            periodSeconds: 5
+          resources:
+            requests: {memory: 256Mi, cpu: 100m}
+            limits: {memory: 768Mi}
+          volumeMounts:
+            - {name: data, mountPath: /data}
+            - {name: config, mountPath: /etc/seaweedfs, readOnly: true}
+      volumes:
+        - name: config
+          secret:
+            secretName: platform-secrets
+            items: [{key: s3.json, path: s3.json}]
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: seaweedfs
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: seaweedfs}
+  ports:
+    - {name: s3, port: 8333}
+    - {name: master, port: 9333}

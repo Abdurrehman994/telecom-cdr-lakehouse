@@ -254,6 +254,21 @@ Apache Polaris and Nessie were the alternatives. Polaris is the Iceberg project'
 
 DuckDB loads a snapshot into one process's memory, which suits a laptop and a few thousand rows. Trino is the engine for scans that do not fit one machine: it plans a query against Iceberg's metadata, prunes partitions and files, and spreads the reading over its workers. Here it runs as a single node, reading the same tables through Lakekeeper with vended credentials. [`trino/queries.sql`](../fraud-detection-system/trino/queries.sql) has examples: aggregates, the join of decisions with CDRs, a query that reads a single day partition, and the sinks' commits from the `$snapshots` metadata table, Kafka offsets included.
 
+### Kubernetes deployment
+
+The same platform also runs on Kubernetes ([`k8s/`](../fraud-detection-system/k8s/)): `k8s/up.sh` creates a local kind cluster, installs the Strimzi operator, and installs a Helm chart. Compose stays the quick local setup; Kubernetes shows how the platform is operated.
+
+- **Kafka by Strimzi.** The cluster ([`kafka.yaml`](../fraud-detection-system/k8s/kafka.yaml)) has the Compose shape (three dual-role KRaft nodes, replication factor 3, `min.insync.replicas=2`), declared as a `Kafka` and a `KafkaNodePool` resource. Topics are `KafkaTopic` resources the operator creates and keeps, replacing the `kafka-init` job. Strimzi 1.3 runs Kafka 4.3; the clients work unchanged against both 3.9 (Compose) and 4.3.
+- **A Deployment per sink, from a list.** The chart's values list the sinks (name, topic, sink file). Each entry becomes a Deployment with one replica and the `Recreate` strategy, so two writers never overlap on a table during a rollout. Onboarding a dataset on Kubernetes is one more entry in that list.
+- **Maintenance as a CronJob.** Compaction, snapshot expiry and orphan cleanup run hourly as a `CronJob` with `concurrencyPolicy: Forbid`, instead of a container that sleeps between runs.
+- **Ordering by waiting, not by sequence.** Pods wait in init containers for what they need: a sink for the warehouse and its topic's contract, ingestion for its contract. Lakekeeper migrates its own database in an init container. The setup jobs (contracts, warehouse) get a new name per Helm revision, since a Job cannot be changed in place.
+- **Images.** The platform's own images are built and loaded into the cluster; public images are pulled from their registries, as a real cluster would. The data contracts are baked into the lakehouse image, so the contracts job registers exactly the contracts that image was built with.
+- **Not deployed here:** Trino, Prometheus, Grafana, Alertmanager and the LLM, to keep the cluster within a laptop's memory. Fraud detection runs without the LLM and Alertmanager by design: uncertain cases fall back to the model score, and notifications fail in the background without slowing detection.
+
+**Tested on kind** with [`k8s/verify.py`](../fraud-detection-system/k8s/verify.py): CDRs sent at 20 per second for 60 seconds through a port-forward, with a Kafka pod deleted at 21 s. Strimzi recreated it and it was ready 75 s later; meanwhile the other two brokers kept every partition writable. All 1,200 accepted CDRs reached `cdr_events` with no loss and no duplicate Kafka position, and each had its decision in `fraud_decisions`.
+
+**What the first run found.** In the first run every CDR landed but no decision did. Fraud detection had started before its Postgres, and its startup retry called `open()` again on the connection pool, which psycopg refuses; the exception ended the consumer thread silently, while `/health` still answered 200. Compose had hidden this by starting Postgres first. The service now opens the pool once and waits on it, and `/health` returns 503 when the consumer thread has stopped, so a liveness probe restarts the container instead of leaving it running without consuming.
+
 ### SeaweedFS for object storage
 
 Any S3-compatible store works, because Iceberg only talks to the S3 API. MinIO was the first choice, but its Docker images are no longer published. SeaweedFS is Apache-licensed, runs as a single container, and is a drop-in replacement for local development. It also implements STS `AssumeRole`, which Lakekeeper uses to vend credentials: a role whose policy allows access to the `warehouse` bucket only. In the cloud this would be Amazon S3 or an equivalent, with IAM roles scoped per table.
@@ -441,7 +456,7 @@ Iceberg table `telecom.fraud_decisions`, partitioned by `day(event_time)` like t
 | Table maintenance | Python job: compaction, snapshot expiry, orphan cleanup, every hour | The same jobs in Spark (`rewrite_data_files`, `expire_snapshots`, `remove_orphan_files`) or the catalog's managed maintenance, scheduled by an orchestrator |
 | OLTP | One Postgres container, schema from an init script | Managed Postgres with replicas and backups; schema migrations with a tool such as Alembic or Flyway |
 | Monitoring | Prometheus, Grafana dashboard, alert rules, one Alertmanager with no receivers | Alerts routed to on-call (e.g. PagerDuty, Slack); long-term metric storage; dashboards and rules kept in version control, as here |
-| Deployment | Docker Compose | Kubernetes, with Kafka run by an operator such as Strimzi |
+| Deployment | Docker Compose, or Kubernetes on kind: Strimzi for Kafka, a Helm chart for the rest | The same chart on a managed cluster: brokers across availability zones, storage classes with backups, Trino and the monitoring stack deployed alongside, and releases rolled out by CI |
 | Secrets | Defaults in Compose | A secret manager; no defaults outside local development |
 
 ## Running and verifying

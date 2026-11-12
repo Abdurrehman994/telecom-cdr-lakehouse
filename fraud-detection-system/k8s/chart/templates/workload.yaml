@@ -1,0 +1,161 @@
+# The workload on the platform: CDR ingestion over HTTP, fraud detection, and the
+# Postgres that holds fraud alerts (OLTP)
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: alerts-db
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  serviceName: alerts-db
+  replicas: 1
+  selector:
+    matchLabels: {app: alerts-db}
+  template:
+    metadata:
+      labels: {app: alerts-db}
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.images.postgres }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - {name: POSTGRES_USER, value: fraud_user}
+            - {name: POSTGRES_DB, value: cdr_database}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: alerts-db-password}}
+            - {name: PGDATA, value: /var/lib/postgresql/data/pgdata}
+          ports: [{containerPort: 5432}]
+          readinessProbe:
+            exec: {command: ["pg_isready", "-U", "fraud_user", "-d", "cdr_database"]}
+            periodSeconds: 5
+          resources:
+            requests: {memory: 128Mi, cpu: 50m}
+            limits: {memory: 512Mi}
+          volumeMounts:
+            - {name: data, mountPath: /var/lib/postgresql/data}
+            # the fraud_alerts schema (postgres/init), loaded into a ConfigMap by k8s/up.sh
+            - {name: schema, mountPath: /docker-entrypoint-initdb.d, readOnly: true}
+      volumes:
+        - name: schema
+          configMap: {name: alerts-schema}
+  volumeClaimTemplates:
+    - metadata: {name: data}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 1Gi}}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alerts-db
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: alerts-db}
+  ports: [{port: 5432}]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cdr-ingestion
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: cdr-ingestion}
+  template:
+    metadata:
+      labels: {app: cdr-ingestion}
+    spec:
+      initContainers:
+        {{- include "platform.waitFor" (dict "root" . "name" "contracts" "url" "http://schema-registry:8081/subjects/cdr-events-value/versions/latest") | nindent 8 }}
+      containers:
+        - name: cdr-ingestion
+          image: {{ .Values.images.ingestion }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - {name: SERVICE_NAME, value: cdr-ingestion}
+            - {name: SERVICE_VERSION, value: 2.0.0}
+            - {name: DEBUG, value: "False"}
+            - {name: KAFKA_BOOTSTRAP_SERVERS, value: {{ .Values.kafkaBootstrap | quote }}}
+            - {name: KAFKA_TOPIC, value: cdr-events}
+            - {name: SCHEMA_REGISTRY_URL, value: "http://schema-registry:8081"}
+            - {name: POSTGRES_HOST, value: alerts-db}
+            - {name: POSTGRES_PORT, value: "5432"}
+            - {name: POSTGRES_USER, value: fraud_user}
+            - {name: POSTGRES_DB, value: cdr_database}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: alerts-db-password}}
+          ports: [{name: http, containerPort: 8080}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8080}
+            periodSeconds: 5
+          resources:
+            requests: {memory: 128Mi, cpu: 100m}
+            limits: {memory: 512Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cdr-ingestion
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: cdr-ingestion}
+  ports: [{name: http, port: 8080}]
+---
+# Fraud detection: the replicas share the cdr-events partitions as one consumer group
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fraud-detection
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.fraudDetection.replicas }}
+  selector:
+    matchLabels: {app: fraud-detection}
+  template:
+    metadata:
+      labels: {app: fraud-detection}
+    spec:
+      initContainers:
+        {{- include "platform.waitFor" (dict "root" . "name" "contracts" "url" "http://schema-registry:8081/subjects/fraud-decisions-value/versions/latest") | nindent 8 }}
+      containers:
+        - name: fraud-detection
+          image: {{ .Values.images.fraudDetection }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          env:
+            - {name: KAFKA_BOOTSTRAP_SERVERS, value: {{ .Values.kafkaBootstrap | quote }}}
+            - {name: KAFKA_TOPIC, value: cdr-events}
+            - {name: KAFKA_GROUP_ID, value: fraud-detection}
+            - {name: KAFKA_DLQ_TOPIC, value: cdr-events-dlq}
+            - {name: KAFKA_DECISIONS_TOPIC, value: fraud-decisions}
+            - {name: SCHEMA_REGISTRY_URL, value: "http://schema-registry:8081"}
+            # no LLM or Alertmanager in this deployment: uncertain cases fall back to the
+            # model score, and alert notifications fail in the background without slowing detection
+            - {name: OLLAMA_HOST, value: "http://ollama:11434"}
+            - {name: POSTGRES_HOST, value: alerts-db}
+            - {name: POSTGRES_PORT, value: "5432"}
+            - {name: POSTGRES_USER, value: fraud_user}
+            - {name: POSTGRES_DB, value: cdr_database}
+            - name: POSTGRES_PASSWORD
+              valueFrom: {secretKeyRef: {name: platform-secrets, key: alerts-db-password}}
+          ports: [{name: http, containerPort: 8001}]
+          readinessProbe:
+            httpGet: {path: /health, port: 8001}
+            periodSeconds: 10
+          # /health fails if the kafka consumer thread has stopped; restart the container then
+          livenessProbe:
+            httpGet: {path: /health, port: 8001}
+            periodSeconds: 15
+            failureThreshold: 4
+          resources:
+            requests: {memory: 192Mi, cpu: 100m}
+            limits: {memory: 768Mi}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: fraud-detection
+  labels: {{- include "platform.labels" . | nindent 4 }}
+spec:
+  selector: {app: fraud-detection}
+  ports: [{name: http, port: 8001}]

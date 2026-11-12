@@ -40,6 +40,7 @@ HTTP ─► cdr-ingestion ─► Kafka ×3 (cdr-events, keyed by customer_id, re
 - **Replicated Kafka, tested by killing brokers.** Three nodes, replication factor 3, `min.insync.replicas=2`. With a broker killed mid-stream, writes went on and no accepted CDR was lost or duplicated; with two killed, the API refused writes rather than confirm unreplicated data.
 - **Production-grade catalog.** Lakekeeper keeps catalog state in Postgres and vends short-lived storage credentials, so engines such as Trino hold no storage keys. It replaced a SQLite-backed catalog that failed under concurrent commits; the tables moved over without copying data.
 - **Table maintenance.** Hourly compaction, snapshot expiry and orphan file cleanup for every sink's table, safe to run while the sinks commit. After a load test it turned 5,081 small files into 301.
+- **Runs on Kubernetes.** Kafka by the Strimzi operator, the rest from a Helm chart: one Deployment per sink, maintenance as a CronJob. Tested by deleting a Kafka pod mid-stream: no accepted event lost, and the test found a startup bug that Compose had hidden.
 - **Observability.** Prometheus metrics from every service, consumer lag and DLQ rate from Kafka, 12 alert rules, and a provisioned Grafana dashboard with a per-table view.
 
 **Workload**
@@ -163,6 +164,20 @@ python ingest-auto.py
 ```
 
 ---
+
+## Running on Kubernetes
+
+The platform also runs on a local Kubernetes cluster: Kafka by the Strimzi operator, everything else from a Helm chart in `fraud-detection-system/k8s/`. Needs `kind`, `kubectl` and `helm`. Stop the Compose stack first; both together need more memory than Docker Desktop usually has.
+
+```bash
+cd fraud-detection-system
+docker compose -f docker-compose.system.yml stop
+bash k8s/up.sh            # kind cluster, Strimzi + Kafka, images, Helm chart
+python k8s/verify.py      # sends CDRs, deletes a Kafka pod mid-stream, checks the lakehouse
+kind delete cluster --name data-platform
+```
+
+Each sink is one entry in `k8s/chart/values.yaml` and becomes its own Deployment; table maintenance is a CronJob. See [Kubernetes deployment](docs/architecture.md#kubernetes-deployment).
 
 ## Accessing Services
 

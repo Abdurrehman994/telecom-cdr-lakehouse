@@ -1,0 +1,104 @@
+# Kafka on Kubernetes, run by the Strimzi operator: the same shape as the Compose stack
+# (three KRaft nodes, each a broker and a controller; replication factor 3,
+# min.insync.replicas=2), declared as resources the operator keeps in place.
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaNodePool
+metadata:
+  name: dual-role
+  labels:
+    strimzi.io/cluster: platform
+spec:
+  replicas: 3
+  roles:
+    - controller
+    - broker
+  storage:
+    type: jbod
+    volumes:
+      - id: 0
+        type: persistent-claim
+        size: 2Gi
+        kraftMetadata: shared
+  resources:
+    requests:
+      memory: 768Mi
+      cpu: 200m
+    limits:
+      memory: 1Gi
+  jvmOptions:
+    -Xms: 384m
+    -Xmx: 384m
+---
+apiVersion: kafka.strimzi.io/v1
+kind: Kafka
+metadata:
+  name: platform
+spec:
+  kafka:
+    version: 4.3.1
+    metadataVersion: 4.3-IV0
+    listeners:
+      - name: plain
+        port: 9092
+        type: internal
+        tls: false
+    config:
+      offsets.topic.replication.factor: 3
+      transaction.state.log.replication.factor: 3
+      transaction.state.log.min.isr: 2
+      default.replication.factor: 3
+      min.insync.replicas: 2
+      unclean.leader.election.enable: false
+      auto.create.topics.enable: false
+  entityOperator:
+    # topics are KafkaTopic resources below, so they are created and kept by the operator
+    topicOperator: {}
+---
+# The platform's topics (in Compose, the kafka-init job creates them)
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: cdr-events
+  labels:
+    strimzi.io/cluster: platform
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    min.insync.replicas: 2
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: cdr-events-dlq
+  labels:
+    strimzi.io/cluster: platform
+spec:
+  partitions: 1
+  replicas: 3
+  config:
+    min.insync.replicas: 2
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: fraud-decisions
+  labels:
+    strimzi.io/cluster: platform
+spec:
+  partitions: 3
+  replicas: 3
+  config:
+    min.insync.replicas: 2
+---
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaTopic
+metadata:
+  name: fraud-decisions-dlq
+  labels:
+    strimzi.io/cluster: platform
+spec:
+  partitions: 1
+  replicas: 3
+  config:
+    min.insync.replicas: 2
