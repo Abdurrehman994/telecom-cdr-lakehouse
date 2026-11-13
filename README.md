@@ -13,6 +13,7 @@ A small data platform that other services build on: replicated Kafka for event s
                      Schema Registry (Avro contracts, FULL_TRANSITIVE)
 HTTP ─► cdr-ingestion ─► Kafka ×3 (cdr-events, keyed by customer_id, replication factor 3)
                             ├─► ml-service ×2 ─► Postgres (fraud_alerts) ─► Alertmanager
+                            │        ├─► Ollama LLM (optional, uncertain cases only)
                             │        └─► Kafka (fraud-decisions)
                             │                └─► sink: fraud_decisions ─┐
                             └─► sink: cdr_events ───────────────────────┴─► Iceberg on S3 (SeaweedFS)
@@ -151,7 +152,9 @@ CONTAINER ID   IMAGE                                  COMMAND                  C
 ...
 ```
 
-### 6. Add Llama3.2 model to OLlama container
+### (Optional) 6. Add the LLM model
+
+Fraud detection asks an LLM only about CDRs whose model score is uncertain. Without a model, those fall back to the score (method `scoring_fallback`), so the pipeline works as is. To use the LLM, pull the model into the Ollama container (about 2 GB):
 
 ```bash
 docker exec -it fraud-detection-ollama ollama pull llama3.2
@@ -207,8 +210,7 @@ Open your web browser and navigate to:
 
 ### Grafana
 - **URL**: http://localhost:3000
-- **Username**: Value from your `.env` file (default: `admin`)
-- **Password**: Value from your `.env` file
+- **Login**: `admin` / `admin` (override with `GRAFANA_ADMIN_USER` and `GRAFANA_ADMIN_PASSWORD`, see [Environment Variables](#2-environment-variables-optional))
 
 **First login steps:**
 1. Navigate to http://localhost:3000
@@ -218,7 +220,7 @@ Open your web browser and navigate to:
 ### Prometheus
 - **URL**: http://localhost:9090
 - **Check targets**: http://localhost:9090/targets
-- Should show `prometheus` and `node-exporter` as UP
+- Every target should be UP: ingestion, both fraud-detection replicas, both sinks, maintenance, Lakekeeper, kafka-exporter, node-exporter and Prometheus itself
 
 ### Alertmanager
 - **URL**: http://localhost:9093
@@ -242,13 +244,13 @@ Open your web browser and navigate to:
   ```
 
 ### Kafka
-- **Brokers**: three nodes (`kafka`, `kafka-2`, `kafka-3`), replication factor 3, `min.insync.replicas=2`. From the host: `localhost:9094`, `9095`, `9096`; containers use `kafka:9092,kafka-2:9092,kafka-3:9092`
+- **Brokers**: three nodes, replication factor 3, `min.insync.replicas=2`. Compose services `kafka`, `kafka-2`, `kafka-3` (containers `kafka_1`, `kafka_2`, `kafka_3`). From the host: `localhost:9094`, `9095`, `9096`; containers use `kafka:9092,kafka-2:9092,kafka-3:9092`
 - **Failure test**: `python loadtest/broker_failure.py --scenario one` (or `two`) kills brokers while sending CDRs and checks that nothing accepted was lost
 - **Topics**: `cdr-events` (3 partitions, keyed by `customer_id`), `fraud-decisions` (3 partitions, one decision per CDR), and a dead-letter topic for each (`cdr-events-dlq`, `fraud-decisions-dlq`)
 - **Consumer group**: `fraud-detection` (`ml-service` and `ml-service2` share the partitions)
-- **Check consumer lag**:
+- **Check consumer lag** (from `fraud-detection-system/`):
   ```bash
-  docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group fraud-detection
+  docker compose -f docker-compose.system.yml exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --group fraud-detection
   ```
 
 ### Fraud Alerts (Postgres)

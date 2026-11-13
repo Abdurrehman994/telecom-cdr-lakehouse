@@ -104,7 +104,7 @@ The migration ran in stages, so the system kept working at every commit:
 
 Fraud patterns are per customer: a SIM swap followed by large payments, or many transactions in a short window. Keying by `customer_id` keeps each customer's CDRs in order inside one partition and sends them to the same consumer.
 
-Trade-off: **key skew**. Customers with more activity make some partitions bigger. In the test data, partitions hold 248, 328 and 224 messages. With real traffic, a few very active subscribers could overload one partition; the usual answers are more partitions or a composite key.
+Trade-off: **key skew**. Customers with more activity make some partitions bigger. The 800 CDRs of the sample dataset split into 248, 328 and 224 messages per partition. With real traffic, a few very active subscribers could overload one partition; the usual answers are more partitions or a composite key.
 
 ### Three Kafka nodes, replicated writes
 
@@ -132,7 +132,7 @@ Kafka offsets and Iceberg data live in different systems, so committing them sep
 
 The writer closes that gap by storing the offsets **inside the Iceberg commit**, as the snapshot property `kafka.<topic>.offsets` (e.g. `kafka.cdr-events.offsets`). Data and position are committed atomically. When partitions are assigned, the writer reads that property and seeks there, ignoring Kafka's own committed offsets. It then commits the same offsets back to Kafka, only so that consumer lag reports correctly.
 
-This was tested by rewinding the writer's Kafka offsets to 0 and restarting it: it resumed at offsets 248, 328 and 225 from Iceberg and wrote no duplicates.
+This was tested by rewinding the writer's Kafka offsets to 0 and restarting it: it resumed at offsets 248, 328 and 225 from Iceberg and wrote no duplicates. (A stored offset is the next one to read, so it equals the number of messages read: the 800 sample CDRs, plus one more test message that this topic held in partition 2.)
 
 A later test found a gap anyway. With the broker stopped, the writer appended a batch to Iceberg and then blocked on the Kafka offset commit. While it waited, the consumer session timed out, the revoke callback ran `flush()` again, and the batch was still in the buffer, so the same 3 rows were appended twice. The commit then failed and the writer crashed. Two changes closed it:
 
@@ -141,7 +141,7 @@ A later test found a gap anyway. With the broker stopped, the writer appended a 
 
 Repeating the same broker outage after the fix: the commit failure was logged, the partitions were revoked and reassigned, the writer did not restart, and no new duplicates were written.
 
-**Offsets name their topic.** Offsets only mean something for the topic they were read from. When the local stack's `cdr-events` was deleted and created again, it restarted at offset 0, but the table still held offsets 248, 328 and 242 from the old topic: the writer would have resumed there and silently skipped the new topic's first messages. Each commit now also stores the topic's id (`kafka.<topic>.topic-id`; Kafka gives every topic a unique id when it is created, KIP-516), and compaction carries it forward. On every partition assignment the writer compares it with the live topic's id. If they differ, the stored offsets belong to a topic that no longer exists: the writer reads the new topic from its beginning, without falling back on the consumer group's equally stale committed offsets, logs an error and counts it for the `LakehouseSourceTopicRecreated` alert. Its next commit replaces the old offsets rather than merging with them.
+**Offsets name their topic.** Offsets only mean something for the topic they were read from. When the local stack's `cdr-events` was deleted and created again, it restarted at offset 0, but the table still held offsets 248, 328 and 242 from the old topic (the sample CDRs plus 18 earlier test messages in partition 2): the writer would have resumed there and silently skipped the new topic's first messages. Each commit now also stores the topic's id (`kafka.<topic>.topic-id`; Kafka gives every topic a unique id when it is created, KIP-516), and compaction carries it forward. On every partition assignment the writer compares it with the live topic's id. If they differ, the stored offsets belong to a topic that no longer exists: the writer reads the new topic from its beginning, without falling back on the consumer group's equally stale committed offsets, logs an error and counts it for the `LakehouseSourceTopicRecreated` alert. Its next commit replaces the old offsets rather than merging with them.
 
 Snapshots written before ids were recorded have offsets without one. For those, an offset past the end of its partition, or a partition that no longer exists, proves the topic was recreated; otherwise the writer adopts the topic and records its id with the next commit. The one case this cannot catch is a topic recreated *and* refilled past the old offsets before the upgrade.
 
@@ -152,7 +152,7 @@ The first version sent JSON, and producers and consumers agreed on its fields in
 Each topic now has an Avro schema in [`contracts/`](../fraud-detection-system/contracts/), with an owner and a compatibility rule:
 
 - **Registered by a job, never by producers.** `schema-init` runs `python -m dataplatform.contracts apply`, which sets each subject's compatibility level and registers the schema. Producers look their schema up and fail if it is not registered (`auto.register.schemas` off, in effect), so a producer cannot put a new schema on a topic by deploying.
-- **`FULL_TRANSITIVE` compatibility.** Every version must read data written with every other version. Producers and consumers can then upgrade in any order, and a sink can read the whole history of its topic. In practice only fields with defaults can be added or removed. `BACKWARD` would allow adding required fields, but then old consumers break while a new producer rolls out.
+- **`FULL_TRANSITIVE` compatibility.** Every version must read data written with every other version. Producers and consumers can then upgrade in any order, and a sink can read the whole history of its topic. In practice only fields with defaults can be added or removed. The weaker rules each fix an upgrade order. `BACKWARD` only requires the new schema to read data written with the old one, so it allows deleting a required field; consumers must then upgrade before producers, or old consumers fail on the new messages. `FORWARD` is the mirror image: old schemas must read new data, so producers upgrade first. `FULL` allows only changes that work both ways, so the order no longer matters, and `TRANSITIVE` checks a new version against every earlier version, not just the latest, which is what lets a sink replay the whole topic.
 - **Messages carry the schema id.** The Confluent wire format (a zero byte, a 4-byte schema id, then the Avro body) means each message is decoded with the exact schema it was written with, and any tool that speaks the format can read the topics.
 - **A shared client library.** `libs/dataplatform` holds the encoding rules, so services cannot disagree on them. It separates a message that can never be decoded (`InvalidMessage`: dead-letter it) from a temporary problem such as the registry being down (retry, never dead-letter a valid message).
 
@@ -246,7 +246,7 @@ The catalog is the one piece every engine shares: it decides which metadata file
 
 Apache Polaris and Nessie were the alternatives. Polaris is the Iceberg project's own catalog but needs more to bootstrap; Nessie's Git-like branches are not something this platform needs yet.
 
-**Moving the tables.** An Iceberg table is fully described by its metadata file in object storage, including its snapshots and the sinks' Kafka positions. [`migrate_catalog.py`](../fraud-detection-system/lakehouse/migrate_catalog.py) moves each table by registering that file in the new catalog, without copying data. On the local stack, with the sinks stopped: both tables were registered at the same snapshots (1,621 and 800 rows), and on restart the sinks resumed at exactly their stored offsets (248, 328 and 224) because the topic ids still matched. 800 more CDRs then landed, and the offsets advanced by exactly 800.
+**Moving the tables.** An Iceberg table is fully described by its metadata file in object storage, including its snapshots and the sinks' Kafka positions. [`migrate_catalog.py`](../fraud-detection-system/lakehouse/migrate_catalog.py) moves each table by registering that file in the new catalog, without copying data. On the local stack, with the sinks stopped: both tables were registered at the same snapshots (1,621 and 800 rows), and on restart the sinks resumed at exactly their stored offsets (248, 328 and 224: the recreated topic held just the 800 sample CDRs) because the topic ids still matched. The `cdr_events` table has more rows than its offsets add up to because it also keeps the rows read from the topic before it was recreated. 800 more CDRs then landed, and the offsets advanced by exactly 800.
 
 **Tested under the load that broke SQLite.** On a fresh stack, 4,800 CDRs were sent while compaction ran three times over both tables. Compaction lost three commit races to the sinks: Lakekeeper rejected the stale commits as conflicts and compaction retried. Afterwards each table held 4,800 rows at 4,800 distinct Kafka positions, the stored offsets summed to 4,800, and the sinks, maintenance and catalog logged no errors.
 
@@ -475,7 +475,7 @@ curl -s http://localhost:8081/subjects
 python ingest-auto/ingest-auto.py --batch-size 50
 
 # Consumer lag for both groups (LAG should reach 0)
-docker exec kafka_1 /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --all-groups
+docker compose -f docker-compose.system.yml exec kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server kafka:9092 --describe --all-groups
 
 # Query the lakehouse with Trino: aggregates, a join of the two sinks' tables, partition pruning, metadata tables
 docker exec trino trino --catalog lakehouse --schema telecom -f /etc/trino/queries.sql
